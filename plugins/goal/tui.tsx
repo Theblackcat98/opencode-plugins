@@ -190,6 +190,75 @@ export default Plugin.define({
 			)
 		}
 
+		// Palette commands live here, not in setup(): keymap.layer() needs the
+		// Solid owner this mounted component provides. The app slot is always
+		// mounted, so the commands are always reachable.
+		const GoalCommands = () => {
+			const ctx = usePlugin()
+			ctx.keymap.layer(() => ({
+				mode: "global",
+				commands: [
+					{
+						id: "goal.status",
+						title: "Show goal status",
+						group: "Goal",
+						palette: true,
+						run: () => ctx.ui.router.navigate({ type: "plugin", name: "goal" }),
+					},
+					{
+						id: "goal.stop",
+						title: "Stop active goal",
+						group: "Goal",
+						palette: true,
+						run: () => {
+							void (async () => {
+								const current = ctx.ui.router.current()
+								let sessionID = current.type === "session" ? current.sessionID : forSession(undefined)?.sessionID
+								if (!sessionID) {
+									const listed = await goal.listGoals({}).catch(() => undefined)
+									const actives = entriesOf(listed).filter((entry) => entry.status === "active")
+									if (!actives.length) {
+										ctx.ui.toast.show({ title: "Goal", message: "No active goal.", variant: "info" })
+										return
+									}
+									const picked = await ctx.ui.dialog.select({
+										title: "Stop goal",
+										options: actives.map((entry) => ({
+											title: entry.objective,
+											value: entry.sessionID,
+											description: `round ${entry.round}/${entry.maxRounds}`,
+										})),
+									})
+									if (!picked) return
+									sessionID = picked
+								} else {
+									const info = forSession(sessionID)
+									const confirmed = await ctx.ui.dialog.confirm({
+										title: "Stop goal?",
+										message: info ? `Stop "${info.objective}"?` : "Stop the active goal in this session?",
+										label: { confirm: "Stop", cancel: "Cancel" },
+									})
+									if (!confirmed) return
+								}
+								try {
+									await goal.stopGoal({ sessionID })
+									ctx.ui.toast.show({ title: "Goal stopped", message: "Goal mode ended.", variant: "info", sessionID })
+								} catch (error) {
+									ctx.ui.toast.show({
+										title: "Goal",
+										message: `Could not stop the goal: ${error instanceof Error ? error.message : String(error)}`,
+										variant: "error",
+										sessionID,
+									})
+								}
+							})()
+						},
+					},
+				],
+			}))
+			return null
+		}
+
 		const unregisterSidebar = context.ui.slot({
 			append: "sidebar.content",
 			render: (input) => <GoalCard sessionID={input.sessionID} />,
@@ -206,6 +275,10 @@ export default Plugin.define({
 			name: "goal",
 			render: () => <GoalRoute />,
 		})
+		const unregisterCommands = context.ui.slot({
+			append: "app",
+			render: () => <GoalCommands />,
+		})
 
 		return () => {
 			for (const stop of unsubscribes) {
@@ -219,6 +292,7 @@ export default Plugin.define({
 			unregisterDot()
 			unregisterPanel()
 			unregisterRoute()
+			unregisterCommands()
 		}
 	},
 })

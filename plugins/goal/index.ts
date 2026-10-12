@@ -330,12 +330,22 @@ export default Plugin.define({
 		// ---- durable goal state -------------------------------------------
 		// goals survives restarts via ctx.storage; verifying/busy/timers are
 		// transient and always start empty.
+		// Replays the command transform so /goal reflects current goal state.
+		// Best-effort: a failed reload must never break goal bookkeeping.
+		const refreshCommands = async (): Promise<void> => {
+			try {
+				await ctx.command.reload()
+			} catch (e) {
+				log.warn(`command reload failed: ${e}`)
+			}
+		}
 		const persistGoal = async (goal: GoalState): Promise<void> => {
 			try {
 				await ctx.storage.set(goalStorageKey(goal.sessionID), { ...goal })
 			} catch (e) {
 				log.warn(`persist failed for ${goal.sessionID}: ${e}`)
 			}
+			await refreshCommands()
 		}
 		const dropGoal = async (sessionID: string): Promise<void> => {
 			goals.delete(sessionID)
@@ -344,6 +354,7 @@ export default Plugin.define({
 			} catch (e) {
 				log.warn(`storage remove failed for ${sessionID}: ${e}`)
 			}
+			await refreshCommands()
 		}
 		// Session-scoped rules (deny dangerous shells, confine external
 		// directories). Children created after this inherit them automatically.
@@ -401,7 +412,10 @@ export default Plugin.define({
 
 		const inject = async (sessionID: string, text: string) => {
 			try {
-				await ctx.session.prompt({ sessionID, text })
+				// Watchdog continuations queue behind in-flight work; the
+				// prompt hook enforces this too. User commands pass their own
+				// delivery through (steer).
+				await ctx.session.prompt({ sessionID, text, delivery: "queue" })
 			} catch (e) {
 				log.warn(`continuation injection failed for ${sessionID}: ${e}`)
 			}
@@ -585,6 +599,8 @@ export default Plugin.define({
 				description: "Drive the agent autonomously until a verifiable goal is reached (goal mode)",
 				async execute({ sessionID, prompt, delivery }) {
 					// Defensive: the expanded prompt may or may not carry the command name.
+					// User invocations keep the requested delivery (steer); only
+					// watchdog continuations use queue (see inject + prompt hook).
 					const raw = (prompt.text ?? "").trim()
 					const args = raw.replace(/^\/?goal\b\s*/i, "").trim()
 
