@@ -119,24 +119,8 @@ const USAGE_TEXT = `Usage:
 Example:
   /goal make all tests pass --check "npm test" --max 5`
 
-const GOAL_PREAMBLE = `# GOAL MODE ACTIVE
-
-Objective: %OBJECTIVE%
-
-You are now in goal mode. A harness-level watchdog verifies your work. You may
-not stop early.
-
-## Protocol
-
-1. Work autonomously toward the objective. Verify your own work as you go (run
-   tests, builds, lint — whatever proves progress).
-2. When you believe the objective is achieved, call the \`goal_complete\` tool
-   with concrete evidence (commands run and their output, files changed).
-   A verifier arbitrates your claim. If the verifier rejects it, keep working.
-3. Do not stop with an open question, a partial result, or a request for
-   confirmation. Continue until verified complete or truly blocked.
-4. If you are truly blocked (missing access, unsatisfiable requirement,
-   repeated dead ends), call the \`goal_block\` tool with what you tried.`
+/** Watchdog injections are prefixed so the prompt hook can route them. */
+const WATCHDOG_PREFIX = "[goal] "
 
 const GOAL_STORAGE_PREFIX = "goal/"
 
@@ -162,7 +146,7 @@ const verifying = new Set<string>()
 const busy = new Set<string>()
 const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -246,6 +230,38 @@ function transcriptText(messages: readonly unknown[]): string[] {
 		if (text) lines.push(`${role}: ${truncate(text, TRANSCRIPT_MSG_LIMIT)}`)
 	}
 	return lines
+}
+
+/**
+ * Full goal contract, delivered as a system instruction on every model call
+ * (context hook). Keeps the user-visible transcript clean: the old preamble
+ * injected this as prompt text.
+ */
+function goalSystemText(goal: GoalState): string {
+	const verification = goal.checkCmd
+		? `Deterministic check: \`${goal.checkCmd}\` must exit with code 0.`
+		: "An LLM judge reviews the transcript and decides completion."
+	return `--- GOAL CONTRACT (authoritative, managed by the goal plugin) ---
+Objective: ${goal.objective}
+Verification: ${verification}
+Round budget: ${goal.maxRounds} (currently round ${goal.round})
+Rules:
+- Work autonomously. Verify your own work (run the check command when defined).
+- When you believe the objective is met, call the \`goal_complete\` tool with concrete evidence.
+- If the verifier rejects, keep working. Do not stop early and do not ask the user questions.
+- If truly blocked, call the \`goal_block\` tool with what you tried.
+- Prefer actions that need no manual approval. If a required action is likely gated by permissions, state that in \`goal_block\` instead of triggering repeated permission prompts.
+---`
+}
+
+/** Short user-visible message that starts goal mode; the contract rides along as system text. */
+function goalStartText(goal: GoalState): string {
+	const verification = goal.checkCmd ? `check: \`${goal.checkCmd}\`` : "verification: LLM judge"
+	return `Goal mode started. Objective: ${goal.objective} (${verification}, max ${goal.maxRounds} rounds). The full contract is attached as a system instruction. Work autonomously toward the objective.`
+}
+
+function isWatchdogText(text: string): boolean {
+	return text.startsWith(WATCHDOG_PREFIX)
 }
 
 export default Plugin.define({
@@ -408,7 +424,7 @@ export default Plugin.define({
 				const verdict = await verify(goal, sessionID)
 				const { ended, message } = await settleVerdict(goal, verdict)
 				if (ended && goal.status !== "done" && goal.status !== "gave_up") return
-				await inject(sessionID, `[goal] ${message}`)
+				await inject(sessionID, `${WATCHDOG_PREFIX}${message}`)
 			} finally {
 				verifying.delete(sessionID)
 			}
@@ -425,22 +441,8 @@ export default Plugin.define({
 			)
 		}
 
-		const contractText = (goal: GoalState): string => {
-			const verification = goal.checkCmd
-				? `Deterministic check: \`${goal.checkCmd}\` must exit with code 0.`
-				: "An LLM judge reviews the transcript and decides completion."
-			return `--- GOAL CONTRACT (authoritative, managed by the goal plugin) ---
-Objective: ${goal.objective}
-Verification: ${verification}
-Round budget: ${goal.maxRounds}
-Rules:
-- Work autonomously. Verify your own work (run the check command when defined).
-- When you believe the objective is met, call the \`goal_complete\` tool with concrete evidence.
-- If the verifier rejects, keep working. Do not stop early and do not ask the user questions.
-- If truly blocked, call the \`goal_block\` tool with what you tried.
-- Prefer actions that need no manual approval. If a required action is likely gated by permissions, state that in \`goal_block\` instead of triggering repeated permission prompts.
----`
-		}
+		// The goal contract ships as a system instruction on every model call
+		// (context hook below), so user-visible prompts stay short.
 
 		// ---- /goal command -----------------------------------------------------
 		// V1 intercepted "command.execute.before" to rewrite the /goal prompt.
@@ -510,8 +512,10 @@ Rules:
 						log.warn(`could not switch to goal-runner: ${e}`)
 					})
 
-					const text = `${GOAL_PREAMBLE.replace("%OBJECTIVE%", goal.objective)}\n\n${contractText(goal)}`
-					await ctx.session.prompt({ sessionID, delivery, text })
+					// The full contract rides along as a system instruction on every
+					// model call (context hook); the user-visible prompt stays short
+					// so transcripts are not polluted.
+					await ctx.session.prompt({ sessionID, delivery, text: goalStartText(goal) })
 				},
 			})
 		})
@@ -619,6 +623,64 @@ Rules:
 			evaluation.effect = "allow"
 		})
 
+		// ---- session hooks: contract without transcript pollution ------------
+		const hookRegistrations: Array<{ dispose: () => Promise<void> }> = []
+
+		// Every agent-loop model call carries the goal contract as a system
+		// instruction. Nothing user-visible is injected.
+		hookRegistrations.push(
+			await ctx.session.hook("context", (event) => {
+				const goal = goals.get(event.sessionID)
+				if (!isGoalActive(goal)) return
+				event.system.push({ type: "text", text: goalSystemText(goal) })
+			}),
+		)
+
+		// Compaction would otherwise drop the objective/round/checkCmd. Keep
+		// them in the summary path: nudge the summarizer via system text, and
+		// prefix an already-computed summary so the state survives.
+		hookRegistrations.push(
+			await ctx.session.hook("compaction", (event) => {
+				const goal = goals.get(event.sessionID)
+				if (!isGoalActive(goal)) return
+				event.system.push({
+					type: "text",
+					text: `Active goal survives this compaction. Preserve verbatim: objective=${JSON.stringify(goal.objective)} round=${goal.round}/${goal.maxRounds} check=${JSON.stringify(goal.checkCmd ?? "LLM judge")}.`,
+				})
+				if (event.result) {
+					event.result = {
+						...event.result,
+						summary: `[goal] objective=${JSON.stringify(goal.objective)} round=${goal.round}/${goal.maxRounds} check=${JSON.stringify(goal.checkCmd ?? "LLM judge")}\n${event.result.summary}`,
+					}
+				}
+			}),
+		)
+
+		// Tag goal prompts and keep watchdog continuations ordered behind
+		// in-flight work instead of steering (interrupting) it.
+		hookRegistrations.push(
+			await ctx.session.hook("prompt", (event) => {
+				const text = event.prompt.text ?? ""
+				const goal = goals.get(event.sessionID)
+				if (!isWatchdogText(text)) {
+					if (isGoalActive(goal)) event.metadata = { ...event.metadata, source: "goal" }
+					return
+				}
+				event.metadata = { ...event.metadata, source: "goal" }
+				event.delivery = "queue"
+			}),
+		)
+
+		// During the verify loop the judge already arbitrates; a 429 retry
+		// storm only delays the verdict. Veto it so verification fails fast
+		// and the agent keeps working instead of backing off.
+		hookRegistrations.push(
+			await ctx.session.hook("retry", (event) => {
+				if (!verifying.has(event.sessionID)) return
+				if (event.error.status === 429) event.decision = { retry: false }
+			}),
+		)
+
 		// ---- event watchdog ----------------------------------------------------
 		// V2 payload lives under `data` (V1 used `properties`).
 		// V1 `session.error` maps to session.execution.failed / .interrupted.
@@ -677,7 +739,7 @@ Rules:
 			}
 		})().catch((e) => log.warn(`event loop stopped: ${e}`))
 
-		return () => {
+		return async () => {
 			controller.abort()
 			for (const t of idleTimers.values()) clearTimeout(t)
 			idleTimers.clear()
@@ -686,6 +748,13 @@ Rules:
 			goals.clear()
 			busy.clear()
 			verifying.clear()
+			for (const registration of hookRegistrations) {
+				try {
+					await registration.dispose()
+				} catch (e) {
+					log.warn(`hook dispose failed: ${e}`)
+				}
+			}
 		}
 	},
 })
