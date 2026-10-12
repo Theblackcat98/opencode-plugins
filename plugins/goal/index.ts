@@ -150,7 +150,7 @@ const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // a restart, running children are gone and links rebuild from new events.
 const childSessions = new Map<string, string>()
 
-export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, goalEventData, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, extractJSONObject, isUnreadableVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, goalEventData, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -184,25 +184,91 @@ function parseGoalArguments(raw: string): { objective: string; checkCmd?: string
 	return { objective, checkCmd: checkCmd?.trim() || undefined, maxRounds }
 }
 
+const JUDGE_ATTEMPTS = 2
+const JUDGE_RAW_LIMIT = 1200
+const DEBUG_PREFIX = "goal/debug/"
+
+/** Strip markdown fences so fenced JSON still parses. */
+function stripFences(text: string): string {
+	return text.replace(/```(?:json)?[ \t]*\r?\n?/gi, "").replace(/```/g, "")
+}
+
+/**
+ * Extract the first balanced {...} object, ignoring braces inside strings.
+ * More robust than first-{ to last-} slicing when the judge adds trailing
+ * commentary containing braces.
+ */
+function extractJSONObject(text: string): string | undefined {
+	const clean = stripFences(text)
+	const start = clean.indexOf("{")
+	if (start === -1) return undefined
+	let depth = 0
+	let inString = false
+	let escaped = false
+	for (let i = start; i < clean.length; i++) {
+		const ch = clean[i]
+		if (inString) {
+			if (escaped) escaped = false
+			else if (ch === "\\") escaped = true
+			else if (ch === '"') inString = false
+			continue
+		}
+		if (ch === '"') inString = true
+		else if (ch === "{") depth++
+		else if (ch === "}") {
+			depth--
+			if (depth === 0) return clean.slice(start, i + 1)
+		}
+	}
+	return undefined
+}
+
+function isUnreadableVerdict(verdict: Verdict): boolean {
+	return verdict.reason.startsWith("verifier returned an unreadable verdict") || verdict.reason === "verifier returned no output"
+}
+
 function parseVerdict(text: string): Verdict {
+	const raw = text.trim()
 	const fallback: Verdict = {
 		complete: false,
-		reason: "verifier returned an unreadable verdict",
+		reason: raw ? `verifier returned an unreadable verdict; raw output: ${truncate(raw, 500)}` : "verifier returned no output",
 		next_action: "re-check the goal state yourself, verify, and continue",
 	}
-	const start = text.indexOf("{")
-	const end = text.lastIndexOf("}")
-	if (start === -1 || end <= start) return fallback
-	try {
-		const parsed = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>
-		return {
-			complete: parsed.complete === true,
-			reason: typeof parsed.reason === "string" ? parsed.reason : fallback.reason,
-			next_action: typeof parsed.next_action === "string" ? parsed.next_action : fallback.next_action,
+	const candidate = extractJSONObject(raw)
+	if (candidate !== undefined) {
+		try {
+			const parsed = JSON.parse(candidate) as Record<string, unknown>
+			if (typeof parsed.complete === "boolean") {
+				return {
+					complete: parsed.complete,
+					reason:
+						typeof parsed.reason === "string" && parsed.reason
+							? parsed.reason
+							: parsed.complete
+								? "judge marked complete without stating evidence"
+								: fallback.reason,
+					next_action:
+						typeof parsed.next_action === "string" && parsed.next_action ? parsed.next_action : fallback.next_action,
+				}
+			}
+		} catch {
+			// fall through to regex recovery below
 		}
-	} catch {
-		return fallback
 	}
+	// Last resort: the judge wrote a "complete" flag but malformed JSON.
+	// The flag alone is still a usable signal; record that it was partial.
+	const flag = raw.match(/"complete"\s*:\s*(true|false)/)
+	if (flag) {
+		const complete = flag[1] === "true"
+		return {
+			complete,
+			reason: complete
+				? `judge marked complete but the verdict was malformed; raw output: ${truncate(raw, 500)}`
+				: `judge marked incomplete but the verdict was malformed; raw output: ${truncate(raw, 500)}`,
+			next_action: fallback.next_action,
+		}
+	}
+	return fallback
 }
 
 function isTextPart(part: unknown): part is { type: "text"; text: string } {
@@ -436,21 +502,45 @@ export default Plugin.define({
 			}
 		}
 
-		const runJudge = async (goal: GoalState, sessionID: string): Promise<Verdict> => {
+		// Plugin console output is not visible in opencode.log, so judge
+		// failures are recorded to storage for post-mortem inspection.
+		const recordJudgeDebug = async (sessionID: string, record: { raw: string; error: string }): Promise<void> => {
 			try {
-				const messages = await ctx.session.context({ sessionID })
-				const lines = transcriptText(messages as readonly unknown[])
-				const tail = lines.slice(-TRANSCRIPT_MESSAGES).join("\n\n")
-
-				const res = await ctx.generate.text({
-					...(judgeModel ? { model: { providerID: judgeModel.providerID, id: judgeModel.modelID } } : {}),
-					prompt: `${JUDGE_SYSTEM}\n\nObjective:\n${goal.objective}\n\nAgent transcript (latest turns):\n${tail || "(empty)"}\n\nDecide whether the objective is verifiably satisfied. Reply with ONLY the JSON object.`,
+				await ctx.storage.set(`${DEBUG_PREFIX}${sessionID}`, {
+					at: Date.now(),
+					raw: truncate(record.raw, JUDGE_RAW_LIMIT),
+					error: truncate(record.error, 500),
 				})
-				return parseVerdict(res.text ?? "")
 			} catch (e) {
-				log.warn(`judge failed: ${e}`)
-				return parseVerdict("")
+				log.warn(`judge debug record failed: ${e}`)
 			}
+		}
+
+		const runJudge = async (goal: GoalState, sessionID: string): Promise<Verdict> => {
+			let lastRaw = ""
+			let lastError = ""
+			for (let attempt = 1; attempt <= JUDGE_ATTEMPTS; attempt++) {
+				try {
+					const messages = await ctx.session.context({ sessionID })
+					const lines = transcriptText(messages as readonly unknown[])
+					const tail = lines.slice(-TRANSCRIPT_MESSAGES).join("\n\n")
+
+					const res = await ctx.generate.text({
+						...(judgeModel ? { model: { providerID: judgeModel.providerID, id: judgeModel.modelID } } : {}),
+						prompt: `${JUDGE_SYSTEM}\n\nObjective:\n${goal.objective}\n\nAgent transcript (latest turns):\n${tail || "(empty)"}\n\nDecide whether the objective is verifiably satisfied. Reply with ONLY the JSON object.`,
+					})
+					lastRaw = res.text ?? ""
+					const verdict = parseVerdict(lastRaw)
+					if (!isUnreadableVerdict(verdict)) return verdict
+					log.warn(`judge attempt ${attempt} unreadable${attempt < JUDGE_ATTEMPTS ? ", retrying" : ""}`)
+				} catch (e) {
+					lastError = `${e}`
+					log.warn(`judge failed: ${e}`)
+					if (attempt === JUDGE_ATTEMPTS) break
+				}
+			}
+			await recordJudgeDebug(sessionID, { raw: lastRaw, error: lastError })
+			return parseVerdict(lastRaw)
 		}
 
 		const verify = async (goal: GoalState, sessionID: string): Promise<Verdict> => {

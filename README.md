@@ -23,6 +23,10 @@ Drives the agent autonomously until a verifiable objective is reached.
   session may settle the goal.
 - The TUI half shows a sidebar card, prompt status dot, detail panel, and
   route, with toasts and notifications on verification.
+- When the LLM judge returns no parseable verdict after a retry, the raw
+  output is kept in plugin storage under `goal/debug/<sessionID>` and a
+  truncated excerpt goes into the agent's next-action message instead of a
+  bare retry loop.
 
 `agents/goal-runner.md` is the agent profile goal sessions switch to.
 

@@ -135,4 +135,36 @@ describe("goal argument parsing", () => {
 		expect(v.complete).toBe(false)
 		expect(v.next_action.length).toBeGreaterThan(0)
 	})
+
+	test("parseVerdict handles fenced JSON and trailing junk", () => {
+		const fenced = '```json\n{"complete": true, "reason": "tests pass", "next_action": ""}\n```'
+		const v = internals.parseVerdict(fenced)
+		expect(v.complete).toBe(true)
+		expect(v.reason).toBe("tests pass")
+		const trailing = '{"complete": false, "reason": "broken", "next_action": "fix it"} some } trailing { junk'
+		const w = internals.parseVerdict(trailing)
+		expect(w.complete).toBe(false)
+		expect(w.reason).toBe("broken")
+	})
+
+	test("parseVerdict recovers a bare complete flag", () => {
+		const v = internals.parseVerdict('verdict: "complete": true (details lost)')
+		expect(v.complete).toBe(true)
+		expect(v.reason).toContain("malformed")
+	})
+
+	test("extractJSONObject skips braces inside strings", () => {
+		const raw = 'note {"complete": false, "reason": "brace } inside", "next_action": "x"} tail'
+		expect(internals.extractJSONObject(raw)).toBe('{"complete": false, "reason": "brace } inside", "next_action": "x"}')
+		expect(internals.extractJSONObject("no braces")).toBeUndefined()
+		expect(internals.extractJSONObject('{"unclosed": true')).toBeUndefined()
+	})
+
+	test("isUnreadableVerdict detects fallbacks only", () => {
+		expect(internals.isUnreadableVerdict(internals.parseVerdict(""))).toBe(true)
+		expect(internals.isUnreadableVerdict(internals.parseVerdict("junk"))).toBe(true)
+		expect(
+			internals.isUnreadableVerdict({ complete: false, reason: "tests fail", next_action: "fix" }),
+		).toBe(false)
+	})
 })
