@@ -93,7 +93,10 @@ describe("subagent root resolution", () => {
 			["a", "b"],
 			["b", "a"],
 		])
-		expect(internals.resolveRoot("a", cyclic)).toBe("a")
+		// Cycle-safe: stops instead of looping (lands on b, the last link
+		// before the repeat).
+		expect(internals.resolveRoot("a", cyclic)).toBe("b")
+		expect(internals.resolveRoot("self", new Map([["self", "self"]]))).toBe("self")
 	})
 })
 
