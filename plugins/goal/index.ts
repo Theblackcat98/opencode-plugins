@@ -250,8 +250,9 @@ export default Plugin.define({
 				: undefined
 		if (!judgeModel) {
 			try {
-				const fallback = ctx.model.default.get()
-				if (fallback) judgeModel = { providerID: fallback.providerID, modelID: fallback.modelID }
+				const fallback = await ctx.model.default()
+				const info = fallback?.data
+				if (info) judgeModel = { providerID: info.providerID, modelID: info.id }
 			} catch {
 				// no default model yet; generate.text will use its own default
 			}
