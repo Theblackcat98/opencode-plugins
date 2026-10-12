@@ -9,5 +9,5 @@
     "jsx": "react-jsx",
     "jsxImportSource": "@opentui/solid"
   },
-  "include": ["plugins/**/*.ts", "plugins/**/*.tsx", "goal.ts"]
+  "include": ["plugins/**/*.ts", "plugins/**/*.tsx"]
 }
