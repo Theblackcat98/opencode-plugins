@@ -80,6 +80,28 @@ describe("goal session rules", () => {
 	})
 })
 
+describe("goal rpc snapshot", () => {
+	test("goalEventData defaults missing checkCmd to empty string", () => {
+		const data = internals.goalEventData({
+			sessionID: "s",
+			objective: "o",
+			maxRounds: 8,
+			round: 0,
+			status: "active",
+			createdAt: 1,
+		})
+		expect(data).toEqual({
+			sessionID: "s",
+			objective: "o",
+			checkCmd: "",
+			status: "active",
+			round: 0,
+			maxRounds: 8,
+			createdAt: 1,
+		})
+	})
+})
+
 describe("subagent root resolution", () => {
 	test("resolveRoot follows chains and stops on cycles", () => {
 		const links = new Map([

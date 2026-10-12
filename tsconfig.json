@@ -7,7 +7,7 @@
     "skipLibCheck": true,
     "lib": ["ESNext"],
     "jsx": "react-jsx",
-    "jsxImportSource": "solid-js"
+    "jsxImportSource": "@opentui/solid"
   },
   "include": ["plugins/**/*.ts", "plugins/**/*.tsx", "goal.ts"]
 }

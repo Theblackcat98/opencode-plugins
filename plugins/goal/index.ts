@@ -25,6 +25,7 @@
 import { exec } from "node:child_process"
 import { homedir } from "node:os"
 import { Plugin } from "@opencode/plugin"
+import { Goal, type GoalInfo } from "./rpc.js"
 
 interface GoalState {
 	sessionID: string
@@ -149,7 +150,7 @@ const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // a restart, running children are gone and links rebuild from new events.
 const childSessions = new Map<string, string>()
 
-export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, goalEventData, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -267,6 +268,19 @@ function isWatchdogText(text: string): boolean {
 	return text.startsWith(WATCHDOG_PREFIX)
 }
 
+/** JSON-safe snapshot of a goal for RPC methods and events. */
+function goalEventData(goal: GoalState): GoalInfo {
+	return {
+		sessionID: goal.sessionID,
+		objective: goal.objective,
+		checkCmd: goal.checkCmd ?? "",
+		status: goal.status,
+		round: goal.round,
+		maxRounds: goal.maxRounds,
+		createdAt: goal.createdAt,
+	}
+}
+
 /**
  * Resolve the root session by following child->parent links (same idea as
  * herdr-agent-state.js childSessions). Cycle-safe: stops on repeats.
@@ -347,6 +361,9 @@ export default Plugin.define({
 				log.warn(`could not clear goal permission rules: ${e}`)
 			}
 		}
+		// Assigned once the RPC registration exists below. settleVerdict and
+		// the tools call it; before registration it is a no-op.
+		let emitGoalEvent: (goal: GoalState) => Promise<void> = async () => {}
 		try {
 			let after: string | undefined
 			for (;;) {
@@ -442,6 +459,7 @@ export default Plugin.define({
 			if (verdict.complete) {
 				goal.status = "done"
 				await persistGoal(goal)
+				await emitGoalEvent(goal)
 				await clearGoalRules(goal.sessionID)
 				return {
 					ended: true,
@@ -452,6 +470,7 @@ export default Plugin.define({
 			if (goal.round >= goal.maxRounds) {
 				goal.status = "gave_up"
 				await persistGoal(goal)
+				await emitGoalEvent(goal)
 				await clearGoalRules(goal.sessionID)
 				return {
 					ended: true,
@@ -459,6 +478,7 @@ export default Plugin.define({
 				}
 			}
 			await persistGoal(goal)
+			await emitGoalEvent(goal)
 			return {
 				ended: false,
 				message: `NOT VERIFIED (round ${goal.round}/${goal.maxRounds}): ${verdict.reason}\nNext action: ${verdict.next_action}\nContinue autonomously toward the goal. Do not ask the user questions.`,
@@ -513,6 +533,47 @@ export default Plugin.define({
 		// The goal contract ships as a system instruction on every model call
 		// (context hook below), so user-visible prompts stay short.
 
+		// Shared stop path for the /goal command and the RPC stopGoal method.
+		const stopGoalById = async (sessionID: string): Promise<boolean> => {
+			const goal = goals.get(sessionID)
+			if (!goal) return false
+			goal.status = "stopped"
+			await persistGoal(goal)
+			await dropGoal(sessionID)
+			await emitGoalEvent(goal)
+			await clearGoalRules(sessionID)
+			clearIdleTimer(sessionID)
+			return true
+		}
+
+		// ---- RPC: listGoals/stopGoal + updated/verified/blocked events -------
+		// The TUI half (tui.tsx) reads state here and renders it; event
+		// subscriptions are live-only, so listGoals is the recovery path.
+		const goalRpc = await ctx.rpc.register(Goal, {
+			listGoals: async () => ({
+				entries: [...goals.values()].sort((a, b) => a.createdAt - b.createdAt).map(goalEventData),
+			}),
+			stopGoal: async (input, rpcCtx) => {
+				const sessionID = (input as { sessionID?: unknown })?.sessionID
+				if (typeof sessionID !== "string" || !sessionID) {
+					return rpcCtx.error("not_found", "Missing sessionID", { sessionID: "" })
+				}
+				const stopped = await stopGoalById(sessionID)
+				if (!stopped) return rpcCtx.error("not_found", "No goal in session", { sessionID })
+				return { stopped: true }
+			},
+		})
+		emitGoalEvent = async (goal: GoalState): Promise<void> => {
+			try {
+				const data = goalEventData(goal)
+				if (goal.status === "done") await goalRpc.events.emit("verified", data)
+				else if (goal.status === "active") await goalRpc.events.emit("updated", data)
+				else await goalRpc.events.emit("blocked", data)
+			} catch (e) {
+				log.warn(`goal event emit failed: ${e}`)
+			}
+		}
+
 		// ---- /goal command -----------------------------------------------------
 		// V1 intercepted "command.execute.before" to rewrite the /goal prompt.
 		// V2 has no global pre-command hook, so the plugin owns the command. It
@@ -528,13 +589,7 @@ export default Plugin.define({
 					const args = raw.replace(/^\/?goal\b\s*/i, "").trim()
 
 					if (args === "stop") {
-						const goal = goals.get(sessionID)
-						if (goal) {
-							goal.status = "stopped"
-							await persistGoal(goal)
-							await dropGoal(sessionID)
-							await clearGoalRules(sessionID)
-						}
+						await stopGoalById(sessionID)
 						clearIdleTimer(sessionID)
 						await ctx.session.prompt({
 							sessionID,
@@ -655,6 +710,7 @@ export default Plugin.define({
 					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
 					goal.status = "gave_up"
 					await persistGoal(goal)
+					await emitGoalEvent(goal)
 					await clearGoalRules(root)
 					clearIdleTimer(root)
 					return {
@@ -834,6 +890,7 @@ export default Plugin.define({
 					if (!goal || goal.status !== "active") continue
 					goal.status = "aborted"
 					await persistGoal(goal)
+					await emitGoalEvent(goal)
 					await clearGoalRules(root)
 					clearIdleTimer(root)
 					log.warn(
@@ -871,6 +928,11 @@ export default Plugin.define({
 			busy.clear()
 			verifying.clear()
 			childSessions.clear()
+			try {
+				await goalRpc.dispose()
+			} catch (e) {
+				log.warn(`rpc dispose failed: ${e}`)
+			}
 			for (const registration of hookRegistrations) {
 				try {
 					await registration.dispose()
