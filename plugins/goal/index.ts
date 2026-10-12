@@ -138,12 +138,31 @@ not stop early.
 4. If you are truly blocked (missing access, unsatisfiable requirement,
    repeated dead ends), call the \`goal_block\` tool with what you tried.`
 
+const GOAL_STORAGE_PREFIX = "goal/"
+
+const goalStorageKey = (sessionID: string): string => `${GOAL_STORAGE_PREFIX}${sessionID}`
+
+function isGoalState(value: unknown): value is GoalState {
+	if (!value || typeof value !== "object") return false
+	const g = value as Record<string, unknown>
+	return (
+		typeof g.sessionID === "string" &&
+		typeof g.objective === "string" &&
+		typeof g.maxRounds === "number" &&
+		typeof g.round === "number" &&
+		(g.status === "active" || g.status === "done" || g.status === "gave_up" || g.status === "aborted" || g.status === "stopped") &&
+		typeof g.createdAt === "number"
+	)
+}
+
 const goals = new Map<string, GoalState>()
+// Transient execution state: never persisted. After a restart these must start
+// empty, otherwise a stale `true` would block the watchdog forever.
 const verifying = new Set<string>()
 const busy = new Set<string>()
 const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -239,6 +258,40 @@ export default Plugin.define({
 			warn: (msg: string) => console.error(`[goal] ${msg}`),
 		}
 
+		// ---- durable goal state -------------------------------------------
+		// goals survives restarts via ctx.storage; verifying/busy/timers are
+		// transient and always start empty.
+		const persistGoal = async (goal: GoalState): Promise<void> => {
+			try {
+				await ctx.storage.set(goalStorageKey(goal.sessionID), { ...goal })
+			} catch (e) {
+				log.warn(`persist failed for ${goal.sessionID}: ${e}`)
+			}
+		}
+		const dropGoal = async (sessionID: string): Promise<void> => {
+			goals.delete(sessionID)
+			try {
+				await ctx.storage.remove(goalStorageKey(sessionID))
+			} catch (e) {
+				log.warn(`storage remove failed for ${sessionID}: ${e}`)
+			}
+		}
+		try {
+			let after: string | undefined
+			for (;;) {
+				const page = await ctx.storage.scan({ prefix: GOAL_STORAGE_PREFIX, after, limit: 100 })
+				for (const entry of page.entries) {
+					if (isGoalState(entry.value)) goals.set(entry.value.sessionID, entry.value)
+					else log.warn(`ignoring malformed stored goal at ${entry.key}`)
+				}
+				if (!page.next) break
+				after = page.next
+			}
+			if (goals.size) log.info(`rehydrated ${goals.size} goal(s) from storage`)
+		} catch (e) {
+			log.warn(`goal rehydration failed: ${e}`)
+		}
+
 		// V1 read this from the config hook as a fallback. V2 exposes the session default model.
 		let judgeModel: { providerID: string; modelID: string } | undefined =
 			process.env.OPENCODE_GOAL_JUDGE_MODEL?.includes("/")
@@ -317,6 +370,7 @@ export default Plugin.define({
 			if (goal.status !== "active") return { ended: true, message: "Goal mode already ended." }
 			if (verdict.complete) {
 				goal.status = "done"
+				await persistGoal(goal)
 				return {
 					ended: true,
 					message: "VERIFIED COMPLETE. Write the final summary for the user: what was done and the evidence.",
@@ -325,11 +379,13 @@ export default Plugin.define({
 			goal.round++
 			if (goal.round >= goal.maxRounds) {
 				goal.status = "gave_up"
+				await persistGoal(goal)
 				return {
 					ended: true,
 					message: `NOT VERIFIED. Round cap (${goal.maxRounds}) reached — stop working and summarize the current state and blockers for the user.`,
 				}
 			}
+			await persistGoal(goal)
 			return {
 				ended: false,
 				message: `NOT VERIFIED (round ${goal.round}/${goal.maxRounds}): ${verdict.reason}\nNext action: ${verdict.next_action}\nContinue autonomously toward the goal. Do not ask the user questions.`,
@@ -404,7 +460,8 @@ Rules:
 						const goal = goals.get(sessionID)
 						if (goal) {
 							goal.status = "stopped"
-							goals.delete(sessionID)
+							await persistGoal(goal)
+							await dropGoal(sessionID)
 						}
 						clearIdleTimer(sessionID)
 						await ctx.session.prompt({
@@ -445,6 +502,7 @@ Rules:
 						createdAt: Date.now(),
 					}
 					goals.set(sessionID, goal)
+					await persistGoal(goal)
 					clearIdleTimer(sessionID)
 
 					// Preserve the agent that commands/goal.md frontmatter selected.
@@ -513,6 +571,7 @@ Rules:
 					const goal = goals.get(toolCtx.sessionID)
 					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
 					goal.status = "gave_up"
+					await persistGoal(goal)
 					clearIdleTimer(toolCtx.sessionID)
 					return {
 						content: `Block acknowledged. Goal mode ended. Summarize the blocker and the current state for the user:\n${truncate(reason, 2000)}`,
@@ -596,6 +655,7 @@ Rules:
 					const goal = goals.get(sessionID)
 					if (!goal || goal.status !== "active") continue
 					goal.status = "aborted"
+					await persistGoal(goal)
 					clearIdleTimer(sessionID)
 					log.warn(
 						type === "session.execution.interrupted"
@@ -609,8 +669,9 @@ Rules:
 					const sessionID = data.sessionID as string | undefined
 					if (!sessionID) continue
 					clearIdleTimer(sessionID)
-					goals.delete(sessionID)
+					await dropGoal(sessionID)
 					busy.delete(sessionID)
+					verifying.delete(sessionID)
 					continue
 				}
 			}
@@ -620,8 +681,11 @@ Rules:
 			controller.abort()
 			for (const t of idleTimers.values()) clearTimeout(t)
 			idleTimers.clear()
+			// Durability: storage keeps goals across reloads; only transient
+			// execution state is cleared here.
 			goals.clear()
 			busy.clear()
+			verifying.clear()
 		}
 	},
 })
