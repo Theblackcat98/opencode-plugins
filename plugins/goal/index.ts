@@ -146,7 +146,7 @@ const verifying = new Set<string>()
 const busy = new Set<string>()
 const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -264,6 +264,26 @@ function isWatchdogText(text: string): boolean {
 	return text.startsWith(WATCHDOG_PREFIX)
 }
 
+interface GoalSessionRule {
+	readonly action: string
+	readonly resource: string
+	readonly effect: "allow" | "deny" | "ask"
+}
+
+/**
+ * Session-scoped permission rules applied on /goal start (via
+ * ctx.session.update). Evaluated after the agent's rules, last match wins;
+ * child sessions inherit the rules in effect when they are created.
+ * NOTE: SDK 2.0.26 has no ctx.permission.rules (docs describe a newer API);
+ * session.update permissions is the equivalent mechanism.
+ */
+function buildGoalSessionRules(): GoalSessionRule[] {
+	const rules: GoalSessionRule[] = GOAL_DENY_SHELL.map((resource) => ({ action: "shell", resource, effect: "deny" as const }))
+	rules.push({ action: "external_directory", resource: "*", effect: "deny" })
+	for (const resource of GOAL_ALLOW_EXTERNAL) rules.push({ action: "external_directory", resource, effect: "allow" })
+	return rules
+}
+
 export default Plugin.define({
 	id: "goal",
 	async setup(ctx) {
@@ -290,6 +310,22 @@ export default Plugin.define({
 				await ctx.storage.remove(goalStorageKey(sessionID))
 			} catch (e) {
 				log.warn(`storage remove failed for ${sessionID}: ${e}`)
+			}
+		}
+		// Session-scoped rules (deny dangerous shells, confine external
+		// directories). Children created after this inherit them automatically.
+		const applyGoalRules = async (sessionID: string): Promise<void> => {
+			try {
+				await ctx.session.update({ sessionID, permissions: buildGoalSessionRules() })
+			} catch (e) {
+				log.warn(`could not apply goal permission rules: ${e}`)
+			}
+		}
+		const clearGoalRules = async (sessionID: string): Promise<void> => {
+			try {
+				await ctx.session.update({ sessionID, permissions: [] })
+			} catch (e) {
+				log.warn(`could not clear goal permission rules: ${e}`)
 			}
 		}
 		try {
@@ -387,6 +423,7 @@ export default Plugin.define({
 			if (verdict.complete) {
 				goal.status = "done"
 				await persistGoal(goal)
+				await clearGoalRules(goal.sessionID)
 				return {
 					ended: true,
 					message: "VERIFIED COMPLETE. Write the final summary for the user: what was done and the evidence.",
@@ -396,6 +433,7 @@ export default Plugin.define({
 			if (goal.round >= goal.maxRounds) {
 				goal.status = "gave_up"
 				await persistGoal(goal)
+				await clearGoalRules(goal.sessionID)
 				return {
 					ended: true,
 					message: `NOT VERIFIED. Round cap (${goal.maxRounds}) reached — stop working and summarize the current state and blockers for the user.`,
@@ -464,6 +502,7 @@ export default Plugin.define({
 							goal.status = "stopped"
 							await persistGoal(goal)
 							await dropGoal(sessionID)
+							await clearGoalRules(sessionID)
 						}
 						clearIdleTimer(sessionID)
 						await ctx.session.prompt({
@@ -505,6 +544,7 @@ export default Plugin.define({
 					}
 					goals.set(sessionID, goal)
 					await persistGoal(goal)
+					await applyGoalRules(sessionID)
 					clearIdleTimer(sessionID)
 
 					// Preserve the agent that commands/goal.md frontmatter selected.
@@ -576,6 +616,7 @@ export default Plugin.define({
 					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
 					goal.status = "gave_up"
 					await persistGoal(goal)
+					await clearGoalRules(toolCtx.sessionID)
 					clearIdleTimer(toolCtx.sessionID)
 					return {
 						content: `Block acknowledged. Goal mode ended. Summarize the blocker and the current state for the user:\n${truncate(reason, 2000)}`,
@@ -718,6 +759,7 @@ export default Plugin.define({
 					if (!goal || goal.status !== "active") continue
 					goal.status = "aborted"
 					await persistGoal(goal)
+					await clearGoalRules(sessionID)
 					clearIdleTimer(sessionID)
 					log.warn(
 						type === "session.execution.interrupted"

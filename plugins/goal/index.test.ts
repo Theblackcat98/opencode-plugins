@@ -68,6 +68,18 @@ describe("goal system contract", () => {
 		expect(internals.isWatchdogText("Goal mode started")).toBe(false)
 	})
 })
+describe("goal session rules", () => {
+	test("buildGoalSessionRules denies shells and confines external dirs", () => {
+		const rules = internals.buildGoalSessionRules()
+		expect(rules.length).toBe(internals.GOAL_DENY_SHELL.length + 1 + internals.GOAL_ALLOW_EXTERNAL.length)
+		// deny * comes before the allows so last-match-wins permits the exceptions
+		const extRules = rules.filter((r) => r.action === "external_directory")
+		expect(extRules[0]).toEqual({ action: "external_directory", resource: "*", effect: "deny" })
+		expect(extRules.slice(1).every((r) => r.effect === "allow")).toBe(true)
+		expect(rules.filter((r) => r.action === "shell").every((r) => r.effect === "deny")).toBe(true)
+	})
+})
+
 describe("goal argument parsing", () => {
 	test("parses check and max flags", () => {
 		const parsed = internals.parseGoalArguments('make tests pass --check "npm test" --max 5')
