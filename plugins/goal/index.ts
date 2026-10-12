@@ -145,8 +145,11 @@ const goals = new Map<string, GoalState>()
 const verifying = new Set<string>()
 const busy = new Set<string>()
 const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// Child -> parent links learned from session.created events. Transient: after
+// a restart, running children are gone and links rebuild from new events.
+const childSessions = new Map<string, string>()
 
-export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -262,6 +265,22 @@ function goalStartText(goal: GoalState): string {
 
 function isWatchdogText(text: string): boolean {
 	return text.startsWith(WATCHDOG_PREFIX)
+}
+
+/**
+ * Resolve the root session by following child->parent links (same idea as
+ * herdr-agent-state.js childSessions). Cycle-safe: stops on repeats.
+ */
+function resolveRoot(sessionID: string, parentOf: ReadonlyMap<string, string>): string {
+	let root = sessionID
+	const seen = new Set<string>([root])
+	for (;;) {
+		const parent = parentOf.get(root)
+		if (!parent || seen.has(parent)) break
+		seen.add(parent)
+		root = parent
+	}
+	return root
 }
 
 interface GoalSessionRule {
@@ -454,17 +473,29 @@ export default Plugin.define({
 			}
 		}
 
+		// True when any session in the root's family (root included) is busy.
+		// Prevents verifying the root while a subagent is still working.
+		const familyBusy = (root: string): boolean => {
+			if (busy.has(root)) return true
+			for (const child of childSessions.keys()) {
+				if (busy.has(child) && resolveRoot(child, childSessions) === root) return true
+			}
+			return false
+		}
+
 		const onIdle = async (sessionID: string) => {
-			const goal = goals.get(sessionID)
-			if (!isGoalActive(goal) || verifying.has(sessionID) || busy.has(sessionID)) return
-			verifying.add(sessionID)
+			// Always arbitrate at the root: child sessions never own goals.
+			const root = resolveRoot(sessionID, childSessions)
+			const goal = goals.get(root)
+			if (!isGoalActive(goal) || verifying.has(root) || busy.has(root) || familyBusy(root)) return
+			verifying.add(root)
 			try {
-				const verdict = await verify(goal, sessionID)
+				const verdict = await verify(goal, root)
 				const { ended, message } = await settleVerdict(goal, verdict)
 				if (ended && goal.status !== "done" && goal.status !== "gave_up") return
-				await inject(sessionID, `${WATCHDOG_PREFIX}${message}`)
+				await inject(root, `${WATCHDOG_PREFIX}${message}`)
 			} finally {
-				verifying.delete(sessionID)
+				verifying.delete(root)
 			}
 		}
 
@@ -581,18 +612,22 @@ export default Plugin.define({
 				},
 				options: { permission: "goal_complete" },
 				async execute(_input, toolCtx) {
-					const goal = goals.get(toolCtx.sessionID)
+					const root = resolveRoot(toolCtx.sessionID, childSessions)
+					if (root !== toolCtx.sessionID) {
+						return { content: "Goal tools are only available in the root goal session, not in subagents. Report your result normally and let the root session decide." }
+					}
+					const goal = goals.get(root)
 					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
-					if (verifying.has(toolCtx.sessionID)) {
+					if (verifying.has(root)) {
 						return { content: "Verifier busy. Wait briefly, then call goal_complete again." }
 					}
-					verifying.add(toolCtx.sessionID)
+					verifying.add(root)
 					try {
-						const verdict = await verify(goal, toolCtx.sessionID)
+						const verdict = await verify(goal, root)
 						const { message } = await settleVerdict(goal, verdict)
 						return { content: message }
 					} finally {
-						verifying.delete(toolCtx.sessionID)
+						verifying.delete(root)
 					}
 				},
 			})
@@ -612,12 +647,16 @@ export default Plugin.define({
 				options: { permission: "goal_block" },
 				async execute(input, toolCtx) {
 					const reason = String((input as { reason?: unknown })?.reason ?? "")
-					const goal = goals.get(toolCtx.sessionID)
+					const root = resolveRoot(toolCtx.sessionID, childSessions)
+					if (root !== toolCtx.sessionID) {
+						return { content: "Goal tools are only available in the root goal session, not in subagents. Report your result normally and let the root session decide." }
+					}
+					const goal = goals.get(root)
 					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
 					goal.status = "gave_up"
 					await persistGoal(goal)
-					await clearGoalRules(toolCtx.sessionID)
-					clearIdleTimer(toolCtx.sessionID)
+					await clearGoalRules(root)
+					clearIdleTimer(root)
 					return {
 						content: `Block acknowledged. Goal mode ended. Summarize the blocker and the current state for the user:\n${truncate(reason, 2000)}`,
 					}
@@ -629,8 +668,16 @@ export default Plugin.define({
 		// V1 "permission.ask" (input.type / input.pattern / output.status)
 		// V2 ctx.permission.hook("evaluate") mutates one evaluation object.
 		await ctx.permission.hook("evaluate", (evaluation) => {
-			const goal = goals.get(evaluation.sessionID)
+			const root = resolveRoot(evaluation.sessionID, childSessions)
+			const goal = goals.get(root)
 			if (!isGoalActive(goal)) return
+			// Subagents do goal work under the same policy, but only the root
+			// session may settle the goal.
+			if (root !== evaluation.sessionID && (evaluation.action === "goal_complete" || evaluation.action === "goal_block")) {
+				log.info(`denied ${evaluation.action} from subagent session ${evaluation.sessionID}`)
+				evaluation.effect = "deny"
+				return
+			}
 			const mode = process.env.OPENCODE_GOAL_PERMISSION ?? "smart"
 			const subject = evaluation.resources.filter(Boolean).join("\n")
 
@@ -717,7 +764,7 @@ export default Plugin.define({
 		// and the agent keeps working instead of backing off.
 		hookRegistrations.push(
 			await ctx.session.hook("retry", (event) => {
-				if (!verifying.has(event.sessionID)) return
+				if (!verifying.has(resolveRoot(event.sessionID, childSessions))) return
 				if (event.error.status === 429) event.decision = { retry: false }
 			}),
 		)
@@ -725,21 +772,45 @@ export default Plugin.define({
 		// ---- event watchdog ----------------------------------------------------
 		// V2 payload lives under `data` (V1 used `properties`).
 		// V1 `session.error` maps to session.execution.failed / .interrupted.
+		// Subagent sessions are tracked via session.created parentID (same idea
+		// as herdr-agent-state.js childSessions): status/idle events resolve to
+		// the root, child turns count toward maxRounds, and only the root may
+		// settle the goal.
+		const countChildTurn = async (sessionID: string): Promise<void> => {
+			const root = resolveRoot(sessionID, childSessions)
+			if (root === sessionID) return
+			const goal = goals.get(root)
+			if (!isGoalActive(goal)) return
+			goal.round++
+			await persistGoal(goal)
+			log.info(`subagent turn counted for goal ${root} (round ${goal.round}/${goal.maxRounds})`)
+		}
+
 		const controller = new AbortController()
 		void (async () => {
 			for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
 				const type = event.type
 				const data = (event as { data?: Record<string, unknown> }).data ?? {}
 
+				if (type === "session.created") {
+					const sessionID = data.sessionID as string | undefined
+					const parentID = data.parentID as string | undefined
+					if (sessionID && parentID) childSessions.set(sessionID, parentID)
+					continue
+				}
+
 				if (type === "session.status") {
 					const sessionID = data.sessionID as string | undefined
 					if (!sessionID) continue
+					const root = resolveRoot(sessionID, childSessions)
 					const statusType = (data.status as { type?: string } | undefined)?.type
-					if (statusType === "idle") busy.delete(sessionID)
-					else busy.add(sessionID)
 					if (statusType === "idle") {
-						const goal = goals.get(sessionID)
-						if (isGoalActive(goal)) scheduleIdleCheck(sessionID)
+						const wasBusy = busy.has(sessionID)
+						busy.delete(sessionID)
+						if (wasBusy) await countChildTurn(sessionID)
+						if (isGoalActive(goals.get(root)) && !familyBusy(root)) scheduleIdleCheck(root)
+					} else {
+						busy.add(sessionID)
 					}
 					continue
 				}
@@ -747,20 +818,24 @@ export default Plugin.define({
 				if (type === "session.idle") {
 					const sessionID = data.sessionID as string | undefined
 					if (!sessionID) continue
-					const goal = goals.get(sessionID)
-					if (isGoalActive(goal)) scheduleIdleCheck(sessionID)
+					const root = resolveRoot(sessionID, childSessions)
+					const wasBusy = busy.has(sessionID)
+					busy.delete(sessionID)
+					if (wasBusy) await countChildTurn(sessionID)
+					if (isGoalActive(goals.get(root)) && !familyBusy(root)) scheduleIdleCheck(root)
 					continue
 				}
 
 				if (type === "session.execution.failed" || type === "session.execution.interrupted") {
 					const sessionID = data.sessionID as string | undefined
 					if (!sessionID) continue
-					const goal = goals.get(sessionID)
+					const root = resolveRoot(sessionID, childSessions)
+					const goal = goals.get(root)
 					if (!goal || goal.status !== "active") continue
 					goal.status = "aborted"
 					await persistGoal(goal)
-					await clearGoalRules(sessionID)
-					clearIdleTimer(sessionID)
+					await clearGoalRules(root)
+					clearIdleTimer(root)
 					log.warn(
 						type === "session.execution.interrupted"
 							? "Goal mode paused: run aborted."
@@ -772,10 +847,15 @@ export default Plugin.define({
 				if (type === "session.deleted") {
 					const sessionID = data.sessionID as string | undefined
 					if (!sessionID) continue
-					clearIdleTimer(sessionID)
-					await dropGoal(sessionID)
+					const root = resolveRoot(sessionID, childSessions)
+					clearIdleTimer(root)
+					await dropGoal(root)
 					busy.delete(sessionID)
 					verifying.delete(sessionID)
+					childSessions.delete(sessionID)
+					for (const [child, parent] of childSessions) {
+						if (parent === sessionID) childSessions.delete(child)
+					}
 					continue
 				}
 			}
@@ -790,6 +870,7 @@ export default Plugin.define({
 			goals.clear()
 			busy.clear()
 			verifying.clear()
+			childSessions.clear()
 			for (const registration of hookRegistrations) {
 				try {
 					await registration.dispose()

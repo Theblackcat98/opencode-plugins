@@ -80,6 +80,23 @@ describe("goal session rules", () => {
 	})
 })
 
+describe("subagent root resolution", () => {
+	test("resolveRoot follows chains and stops on cycles", () => {
+		const links = new Map([
+			["child", "root"],
+			["grandchild", "child"],
+		])
+		expect(internals.resolveRoot("grandchild", links)).toBe("root")
+		expect(internals.resolveRoot("root", links)).toBe("root")
+		expect(internals.resolveRoot("unknown", links)).toBe("unknown")
+		const cyclic = new Map([
+			["a", "b"],
+			["b", "a"],
+		])
+		expect(internals.resolveRoot("a", cyclic)).toBe("a")
+	})
+})
+
 describe("goal argument parsing", () => {
 	test("parses check and max flags", () => {
 		const parsed = internals.parseGoalArguments('make tests pass --check "npm test" --max 5')
