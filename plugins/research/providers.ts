@@ -19,11 +19,14 @@ export type Backend = "tavily" | "exa" | "firecrawl" | "jina"
 export class ProviderError extends Error {
 	readonly backend: Backend
 	readonly status?: number
-	constructor(backend: Backend, message: string, status?: number) {
+	/** Delay the server asked for, from a Retry-After header. */
+	readonly retryAfterMs?: number
+	constructor(backend: Backend, message: string, status?: number, retryAfterMs?: number) {
 		super(message)
 		this.name = "ProviderError"
 		this.backend = backend
 		this.status = status
+		this.retryAfterMs = retryAfterMs
 	}
 }
 
@@ -43,6 +46,11 @@ export interface ResearchConfig {
 	readonly allowPrivateUrls: boolean
 	readonly requestTimeoutMs: number
 	readonly crawlTimeoutMs: number
+	/** How many times a retryable failure is retried. 0 disables retry. */
+	readonly retryAttempts: number
+	readonly retryBaseDelayMs: number
+	/** Optional sink for retry diagnostics, so the plugin log explains a slow call. */
+	readonly retryLog?: (message: string) => void
 }
 
 export const TAVILY_BASE = "https://api.tavily.com"
@@ -67,6 +75,18 @@ export const INTERNALS = {
 	extractErrorMessage,
 	parseJinaText,
 	publishedDateSince,
+	fetchJson,
+	fetchText,
+	withRetry,
+	isRetryableStatus,
+	parseRetryAfter,
+	retryDelayMs,
+	normalizeHost,
+	hostMatchesDomain,
+	filterResultsByDomain,
+	describeUnsupportedFilters,
+	normalizeUrl,
+	mergeSearchResults,
 }
 
 // ---------------------------------------------------------------- config ----
@@ -91,6 +111,15 @@ export function resolveConfig(
 		if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv
 		return fallback
 	}
+	// A count may legitimately be 0 (retry disabled), so this one differs from pickNumber.
+	const pickCount = (optionName: string, envName: string, fallback: number): number => {
+		const fromOption = options[optionName]
+		if (typeof fromOption === "number" && Number.isInteger(fromOption) && fromOption >= 0) return fromOption
+		const rawEnv = env[envName]
+		const fromEnv = Number(rawEnv)
+		if (rawEnv !== undefined && rawEnv !== "" && Number.isInteger(fromEnv) && fromEnv >= 0) return fromEnv
+		return fallback
+	}
 	return {
 		tavilyKey: pick("tavilyKey", "TAVILY_API_KEY", "TVLY_API_KEY"),
 		exaKey: pick("exaKey", "EXA_API_KEY"),
@@ -99,6 +128,8 @@ export function resolveConfig(
 		allowPrivateUrls: options.allowPrivateUrls === true,
 		requestTimeoutMs: pickNumber("requestTimeoutMs", "RESEARCH_REQUEST_TIMEOUT_MS", 60_000),
 		crawlTimeoutMs: pickNumber("crawlTimeoutMs", "RESEARCH_CRAWL_TIMEOUT_MS", 180_000),
+		retryAttempts: pickCount("retryAttempts", "RESEARCH_RETRY_ATTEMPTS", 2),
+		retryBaseDelayMs: pickNumber("retryBaseDelayMs", "RESEARCH_RETRY_BASE_DELAY_MS", 1_000),
 	}
 }
 
@@ -176,7 +207,7 @@ function describeError(error: unknown): string {
 	return String(error)
 }
 
-async function fetchJson(
+async function fetchJsonOnce(
 	backend: Backend,
 	url: string,
 	init: RequestInit,
@@ -197,7 +228,12 @@ async function fetchJson(
 		}
 		if (!response.ok) {
 			const detail = extractErrorMessage(body) ?? text.slice(0, 300).trim()
-			throw new ProviderError(backend, `${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, response.status)
+			throw new ProviderError(
+				backend,
+				`${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
+				response.status,
+				parseRetryAfter(response.headers.get("retry-after")),
+			)
 		}
 		if (body === undefined) throw new ProviderError(backend, "Response was not valid JSON")
 		return body
@@ -210,7 +246,7 @@ async function fetchJson(
 	}
 }
 
-async function fetchText(
+async function fetchTextOnce(
 	backend: Backend,
 	url: string,
 	init: RequestInit,
@@ -223,7 +259,12 @@ async function fetchText(
 		const text = await response.text()
 		if (!response.ok) {
 			const detail = extractErrorMessage(text) ?? text.slice(0, 300).trim()
-			throw new ProviderError(backend, `${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`, response.status)
+			throw new ProviderError(
+				backend,
+				`${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
+				response.status,
+				parseRetryAfter(response.headers.get("retry-after")),
+			)
 		}
 		return text
 	} catch (error) {
@@ -233,6 +274,104 @@ async function fetchText(
 	} finally {
 		link.done()
 	}
+}
+
+// ----------------------------------------------------------------- retry ----
+
+/** 429 and 5xx can pass on a second try; 4xx cannot. */
+export function isRetryableStatus(status: number | undefined): boolean {
+	if (status === undefined) return false
+	return status === 429 || (status >= 500 && status <= 599)
+}
+
+/** Retry-After is either a number of seconds or an HTTP date. */
+export function parseRetryAfter(value: string | null | undefined, now = Date.now()): number | undefined {
+	if (!value) return undefined
+	const trimmed = value.trim()
+	if (!trimmed) return undefined
+	const seconds = Number(trimmed)
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000)
+	const date = Date.parse(trimmed)
+	if (Number.isFinite(date)) return Math.max(0, date - now)
+	return undefined
+}
+
+/**
+ * Exponential backoff with up to 25 percent jitter, so parallel sessions do
+ * not resynchronise after a shared rate limit. A server-provided delay wins,
+ * but is capped so a hostile header cannot stall the call.
+ */
+export function retryDelayMs(
+	attempt: number,
+	retryAfterMs: number | undefined,
+	baseMs: number,
+	capMs: number,
+	random: () => number = Math.random,
+): number {
+	const exponential = baseMs * 4 ** Math.max(0, attempt - 1)
+	const base = retryAfterMs !== undefined ? Math.min(retryAfterMs, capMs) : Math.min(exponential, capMs)
+	const jittered = base + base * 0.25 * random()
+	return Math.round(Math.min(jittered, Math.max(0, capMs)))
+}
+
+function isRetryableError(error: ProviderError): boolean {
+	if (error.status !== undefined) return isRetryableStatus(error.status)
+	// A network failure is worth one more try. A timeout or a caller abort is not:
+	// the request may already have reached the provider.
+	return !/timed out|cancel/i.test(error.message)
+}
+
+/** Bounded retry around one provider call. Cancellable at every step. */
+async function withRetry<T>(
+	backend: Backend,
+	cfg: ResearchConfig,
+	signal: AbortSignal | undefined,
+	attempt: (attemptNumber: number) => Promise<T>,
+): Promise<T> {
+	const maxAttempts = 1 + Math.max(0, Math.floor(cfg.retryAttempts))
+	for (let number = 1; ; number += 1) {
+		if (signal?.aborted) throw new ProviderError(backend, "Request cancelled")
+		try {
+			return await attempt(number)
+		} catch (error) {
+			if (!(error instanceof ProviderError) || !isRetryableError(error) || number >= maxAttempts) {
+				if (error instanceof ProviderError && number >= maxAttempts && isRetryableError(error)) {
+					cfg.retryLog?.(`giving up on ${backend} after ${number} attempt(s): ${error.message}`)
+				}
+				throw error
+			}
+			const delay = retryDelayMs(number, error.retryAfterMs, cfg.retryBaseDelayMs, cfg.requestTimeoutMs)
+			cfg.retryLog?.(
+				`retrying ${backend} in ${delay}ms (attempt ${number + 1}/${maxAttempts}, ${
+					error.status !== undefined ? `status ${error.status}` : "network error"
+				}): ${error.message}`,
+			)
+			await sleep(delay, signal)
+			if (signal?.aborted) throw new ProviderError(backend, "Request cancelled")
+		}
+	}
+}
+
+async function fetchJson(
+	backend: Backend,
+	url: string,
+	init: RequestInit,
+	cfg: ResearchConfig,
+	signal?: AbortSignal,
+	retry = true,
+): Promise<unknown> {
+	if (!retry) return fetchJsonOnce(backend, url, init, cfg, signal)
+	return withRetry(backend, cfg, signal, () => fetchJsonOnce(backend, url, init, cfg, signal))
+}
+
+async function fetchText(
+	backend: Backend,
+	url: string,
+	init: RequestInit,
+	cfg: ResearchConfig,
+	signal?: AbortSignal,
+): Promise<string> {
+	return withRetry(backend, cfg, signal, () => fetchTextOnce(backend, url, init, cfg, signal))
 }
 
 // -------------------------------------------------------------- url guard ---
@@ -310,6 +449,212 @@ export interface SearchOutcome {
 	readonly backend: Backend
 	readonly answer?: string
 	readonly results: readonly SearchResult[]
+	/** Set when a backend applied a local domain filter to the raw result list. */
+	readonly filter?: { readonly returned: number; readonly removed: number }
+}
+
+// ------------------------------------------------------- search filters ----
+
+/**
+ * A domain matches on an exact host or a subdomain, so "example.com" covers
+ * "docs.example.com" but not the lookalike "example.com.evil.net".
+ */
+export function normalizeHost(hostname: string): string {
+	return hostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "")
+}
+
+function normalizeDomainFilter(value: string): string {
+	let domain = value.trim().toLowerCase()
+	if (!domain) return ""
+	if (domain.includes("://")) {
+		try {
+			domain = new URL(domain).hostname
+		} catch {
+			// Keep the raw text; the match below simply fails.
+		}
+	}
+	domain = domain.replace(/^\*\./, "")
+	return normalizeHost(domain)
+}
+
+export function hostMatchesDomain(hostname: string, domain: string): boolean {
+	const host = normalizeHost(hostname)
+	const target = normalizeDomainFilter(domain)
+	if (!host || !target) return false
+	return host === target || host.endsWith(`.${target}`)
+}
+
+/**
+ * Jina search has no domain filter of its own, so the list is filtered here.
+ * Filtering happens before the caller slices to its limit, so the limit still
+ * returns the requested number of usable results when enough remain.
+ */
+export function filterResultsByDomain(
+	results: readonly SearchResult[],
+	filters: { includeDomains?: readonly string[]; excludeDomains?: readonly string[] },
+): { results: SearchResult[]; returned: number; removed: number } {
+	const includes = (filters.includeDomains ?? []).filter((entry) => entry.trim() !== "")
+	const excludes = (filters.excludeDomains ?? []).filter((entry) => entry.trim() !== "")
+	if (!includes.length && !excludes.length) {
+		return { results: [...results], returned: results.length, removed: 0 }
+	}
+	const kept: SearchResult[] = []
+	for (const result of results) {
+		let host: string
+		try {
+			host = new URL(result.url).hostname
+		} catch {
+			// A result whose URL cannot be parsed cannot be proven to satisfy the
+			// filter, so it is dropped rather than passed through.
+			continue
+		}
+		if (includes.length && !includes.some((domain) => hostMatchesDomain(host, domain))) continue
+		if (excludes.some((domain) => hostMatchesDomain(host, domain))) continue
+		kept.push(result)
+	}
+	return { results: kept, returned: results.length, removed: results.length - kept.length }
+}
+
+/**
+ * State the filters a backend could not apply, instead of letting the model
+ * believe the result set obeys a rule that was never enforced.
+ */
+export function describeUnsupportedFilters(
+	backend: Backend,
+	requested: { timeRange?: unknown; days?: unknown; includeAnswer?: unknown; topic?: unknown },
+): string[] {
+	if (backend !== "jina") return []
+	const notes: string[] = []
+	if (requested.timeRange !== undefined || requested.days !== undefined) {
+		notes.push("jina search results carry no publication date, so the time window was not applied")
+	}
+	if (typeof requested.topic === "string" && requested.topic !== "general") {
+		notes.push(`jina search has no "${requested.topic}" topic filter`)
+	}
+	if (requested.includeAnswer === true) {
+		notes.push("jina search returns no generated answer")
+	}
+	return notes
+}
+
+// ---------------------------------------------------------- merge search ----
+
+/** Parameters that never change which page a result points at. */
+const TRACKING_PARAMS = new Set([
+	"fbclid",
+	"gclid",
+	"msclkid",
+	"yclid",
+	"mc_cid",
+	"mc_eid",
+	"igshid",
+	"ref_src",
+	"ref_url",
+	"_hsenc",
+	"_hsmi",
+	"spm",
+])
+
+/**
+ * The deduplication key for a URL: lower-case host without "www.", no
+ * fragment, no tracking parameters, no default port and no trailing slash.
+ */
+export function normalizeUrl(raw: string): string {
+	let url: URL
+	try {
+		url = new URL(raw)
+	} catch {
+		return raw.trim().toLowerCase()
+	}
+	const host = url.hostname.toLowerCase().replace(/^www\./, "")
+	const defaultPort =
+		(url.protocol === "http:" && url.port === "80") || (url.protocol === "https:" && url.port === "443")
+	const port = url.port && !defaultPort ? `:${url.port}` : ""
+	const path = url.pathname.replace(/\/+$/, "")
+	const params = [...url.searchParams.entries()]
+		.filter(([key]) => {
+			const name = key.toLowerCase()
+			return !TRACKING_PARAMS.has(name) && !name.startsWith("utm_")
+		})
+		.sort(([a], [b]) => a.localeCompare(b))
+	const search = params.length ? `?${new URLSearchParams(params).toString()}` : ""
+	return `${host}${port}${path}${search}`
+}
+
+export interface MergedSearchResult extends SearchResult {
+	/** Every engine that returned this URL, in merge order. */
+	readonly engines: readonly Backend[]
+	/** 1-based rank per engine. */
+	readonly positions: Readonly<Record<string, number>>
+}
+
+export interface MergedSearchOutcome {
+	readonly results: readonly MergedSearchResult[]
+	readonly answered: readonly Backend[]
+	readonly failed: readonly { readonly backend: Backend; readonly error: string }[]
+	/** Same URL ranked far apart by two engines: a weak ranking, worth a read. */
+	readonly disagreements: readonly { readonly url: string; readonly title: string; readonly positions: readonly number[] }[]
+}
+
+/** Rank gap that counts as a disagreement between engines. */
+export const MERGE_POSITION_GAP = 5
+
+/**
+ * Combine result lists without losing order: the first engine's ranking, then
+ * what each later engine adds. A URL found by two engines appears once and
+ * keeps both labels, because agreement between engines is the strongest signal
+ * in the set.
+ */
+export function mergeSearchResults(
+	lists: readonly { readonly backend: Backend; readonly results: readonly SearchResult[] }[],
+): MergedSearchOutcome {
+	const order: string[] = []
+	const merged = new Map<string, { result: MergedSearchResult; engines: Backend[]; positions: Record<string, number> }>()
+	const answered: Backend[] = []
+	for (const list of lists) {
+		answered.push(list.backend)
+		list.results.forEach((result, index) => {
+			const key = normalizeUrl(result.url)
+			const existing = merged.get(key)
+			if (existing) {
+				if (!existing.engines.includes(list.backend)) existing.engines.push(list.backend)
+				existing.positions[list.backend] = index + 1
+				return
+			}
+			const entry = {
+				result: {
+					title: result.title,
+					url: result.url,
+					snippet: result.snippet,
+					score: result.score,
+					content: result.content,
+					engines: [] as Backend[],
+					positions: {} as Record<string, number>,
+				},
+				engines: [list.backend],
+				positions: { [list.backend]: index + 1 },
+			}
+			order.push(key)
+			merged.set(key, entry)
+		})
+	}
+	const results: MergedSearchResult[] = []
+	const disagreements: { url: string; title: string; positions: number[] }[] = []
+	for (const key of order) {
+		const entry = merged.get(key)
+		if (!entry) continue
+		const result: MergedSearchResult = {
+			...entry.result,
+			engines: [...entry.engines],
+			positions: { ...entry.positions },
+		}
+		results.push(result)
+		const ranks = Object.values(entry.positions)
+		if (ranks.length >= 2 && Math.max(...ranks) - Math.min(...ranks) >= MERGE_POSITION_GAP) {
+			disagreements.push({ url: result.url, title: result.title, positions: ranks.slice().sort((a, b) => a - b) })
+		}
+	}
+	return { results, answered, failed: [], disagreements }
 }
 
 export interface PageResult {
@@ -703,12 +1048,15 @@ export async function firecrawlCrawl(
 
 	const deadline = Date.now() + cfg.crawlTimeoutMs
 	for (;;) {
+		// The polling loop has its own deadline and sleep, so it does not retry:
+		// a slow job would otherwise stack backoff on top of its own wait.
 		const status = await fetchJson(
 			"firecrawl",
 			`${FIRECRAWL_BASE}/crawl/${jobID}`,
 			{ headers: { authorization: `Bearer ${cfg.firecrawlKey}` } },
 			cfg,
 			signal,
+			false,
 		)
 		const record = asRecord(status)
 		const state = firstString(record?.status) ?? "unknown"
@@ -818,10 +1166,16 @@ export function parseJinaText(text: string): { title: string; url: string; conte
 	}
 }
 
+export interface JinaSearchParams {
+	query: string
+	limit: number
+	includeDomains?: string[]
+	excludeDomains?: string[]
+}
+
 export async function jinaSearch(
 	cfg: ResearchConfig,
-	query: string,
-	limit: number,
+	params: JinaSearchParams,
 	signal?: AbortSignal,
 ): Promise<SearchOutcome> {
 	const headers: Record<string, string> = {
@@ -829,7 +1183,7 @@ export async function jinaSearch(
 		"x-respond-with": "no-content",
 	}
 	if (cfg.jinaKey) headers.authorization = `Bearer ${cfg.jinaKey}`
-	const url = `${JINA_SEARCH_BASE}/${encodeURIComponent(query)}`
+	const url = `${JINA_SEARCH_BASE}/${encodeURIComponent(params.query)}`
 	const text = await fetchText("jina", url, { headers }, cfg, signal)
 	let body: unknown
 	try {
@@ -838,7 +1192,12 @@ export async function jinaSearch(
 		throw new ProviderError("jina", "Search response was not valid JSON")
 	}
 	const outcome = normalizeJinaSearch(body)
-	return { ...outcome, results: outcome.results.slice(0, limit) }
+	const filtered = filterResultsByDomain(outcome.results, params)
+	return {
+		...outcome,
+		results: filtered.results.slice(0, params.limit),
+		filter: filtered.removed ? { returned: filtered.returned, removed: filtered.removed } : undefined,
+	}
 }
 
 export async function jinaRead(

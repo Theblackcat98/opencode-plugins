@@ -55,18 +55,30 @@ site mapping), **Exa** (neural/semantic search, find-similar-by-URL),
 LLM-ready markdown, works without an API key). Full details in
 `plugins/research/README.md`.
 
-- Six tools under the `research` namespace: `search`, `find_similar`, `read`,
-  `crawl`, `map` and `extract`.
-- The point of the plugin is the routing block, a system instruction on every
-  model call that tells the model which backend fits which job, and in what
-  order to work. It is rebuilt from the backends that actually have
-  credentials, so a route without a key is never advertised.
+- Seven tools under the `research` namespace: `search`, `find_similar`,
+  `sources`, `read`, `crawl`, `map` and `extract`.
+- The point of the plugin is the routing block, a system instruction that tells
+  the model which backend fits which job, and in what order to work. It is
+  rebuilt from the backends that actually have credentials, so a route without
+  a key is never advertised. It is injected only for an active `/research`
+  brief (or with `routingAlways`), not on every model call in every session.
 - `research_search` takes an `engine` parameter (`auto`, `neural`, `keyword`)
   so the model can deliberately ask for semantic search on conceptual or
   academic questions instead of always going to the keyword engine.
+  `mode: "merge"` queries two engines and returns the deduplicated union,
+  labelled with every engine that found each result.
 - Each tool falls back through its backends in order and names the one that
   answered. Jina is the last-resort reader, so `read` works with no
-  credentials at all.
+  credentials at all. Jina's own lack of domain/time filters is handled
+  explicitly: domains are filtered locally, and the filters it cannot apply are
+  named in the output.
+- Provider calls retry `429`/`5xx` with bounded exponential backoff, honour
+  `Retry-After`, and never retry a `4xx`, a timeout or an abort.
+- `research_read` caches pages for 24 hours (keyed by backend, URL and output
+  options) and says when a page came from the cache.
+- A per-session source ledger records what was actually read;
+  `research_sources` lists it, so the final source list is not reconstructed
+  from memory. `/research stats` shows counters per backend plus cache hits.
 - `/research <question>` starts a sourced task: the question is durable, and a
   stricter contract (cite every claim, prefer primary sources, never guess)
   rides along as a system instruction and survives compaction.

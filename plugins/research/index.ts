@@ -1,23 +1,25 @@
 /**
  * Research Plugin (OpenCode V2)
  *
- * One research surface over three upstreams, with an explicit routing
+ * One research surface over four upstreams, with an explicit routing
  * procedure so the model picks the right backend per job instead of defaulting
  * to whichever tool it saw first.
  *
  *   - Tavily       web search already shaped for agents, plus site mapping
+ *   - Exa          neural search, plus "find pages like this URL"
  *   - Firecrawl    page scraping, site crawling, structured extraction
  *   - Jina AI      URL -> LLM-ready markdown, works without an API key
  *
- * The routing block is a system instruction on every model call, rebuilt from
- * the backends that actually have credentials, so a missing key removes a
- * route instead of sending the model into a dead end.
+ * The routing block is a system instruction, rebuilt from the backends that
+ * actually have credentials, so a missing key removes a route instead of
+ * sending the model into a dead end. It rides only on sessions that need it:
+ * an active /research brief, or the routingAlways setting.
  *
  * V2 API used (verified against @opencode/plugin 2.0.26):
  *   ctx.tool.transform + JSON Schema input + editor.namespace
  *   ctx.command.transform      (the /research command)
  *   ctx.session.hook("context") (routing block and research contract)
- *   ctx.storage                (durable research briefs)
+ *   ctx.storage                (briefs, read cache, source ledger, counters)
  *   ctx.websearch.transform    (optional Tavily websearch provider)
  */
 
@@ -26,6 +28,8 @@ import {
 	InputError,
 	ProviderError,
 	assertWebUrl,
+	clamp,
+	describeUnsupportedFilters,
 	exaFindSimilar,
 	exaSearch,
 	firecrawlCrawl,
@@ -34,6 +38,7 @@ import {
 	firecrawlScrape,
 	jinaRead,
 	jinaSearch,
+	mergeSearchResults,
 	publishedDateSince,
 	resolveConfig,
 	tavilyExtract,
@@ -41,18 +46,45 @@ import {
 	tavilySearch,
 	type Backend,
 	type ExtractOutcome,
+	type MergedSearchOutcome,
 	type PageResult,
 	type ResearchConfig,
 	type SearchOutcome,
 } from "./providers.js"
 import {
+	CACHE_STORAGE_PREFIX,
+	DEFAULT_CACHE_MAX_ENTRIES,
+	DEFAULT_CACHE_TTL_MS,
+	DEFAULT_LEDGER_MAX_ENTRIES,
+	LEDGER_EXCERPT_CHARS,
+	LIFETIME_STATS_ID,
+	appendSource,
+	cacheEntryKey,
+	emptyLedger,
+	emptyStats,
+	isCachedPage,
+	isCacheFresh,
+	isResearchStats,
+	isSessionLedger,
+	sourceStorageKey,
+	statsStorageKey,
+	type CachedPage,
+	type ResearchStats,
+	type SessionLedger,
+	type SourceEntry,
+} from "./state.js"
+import {
 	buildResearchContract,
 	buildRoutingText,
+	formatCacheNote,
 	formatCrawlResults,
 	formatExtractResult,
+	formatMergedSearchResults,
 	formatPageResult,
 	formatSearchResults,
+	formatSourceLedger,
 	formatSourceList,
+	formatStats,
 	truncate,
 } from "./routing.js"
 
@@ -123,6 +155,11 @@ function asNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
+/** ctx.storage takes a JSON object; the state interfaces are plain but carry no index signature. */
+function storageJson<T extends object>(value: T): Record<string, any> {
+	return value as unknown as Record<string, any>
+}
+
 function asObjectArray(value: unknown): Record<string, unknown>[] | undefined {
 	if (!Array.isArray(value)) return undefined
 	const list = value.filter(
@@ -152,6 +189,75 @@ function exaWindowDays(args: Record<string, unknown>): number | undefined {
 	}
 }
 
+// --------------------------------------------------------- state options ----
+
+export interface StateOptions {
+	readonly cacheEnabled: boolean
+	readonly cacheTtlMs: number
+	readonly cacheMaxEntries: number
+	readonly ledgerMaxEntries: number
+	readonly routingAlways: boolean
+	readonly injectRouting: boolean
+}
+
+function positiveNumber(value: unknown, envValue: string | undefined, fallback: number): number {
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) return value
+	if (envValue !== undefined && envValue.trim() !== "") {
+		const parsed = Number(envValue)
+		if (Number.isFinite(parsed) && parsed > 0) return parsed
+	}
+	return fallback
+}
+
+function flagDefaultOn(value: unknown, envValue: string | undefined, fallback: boolean): boolean {
+	if (typeof value === "boolean") return value
+	if (envValue !== undefined) {
+		const normalized = envValue.trim().toLowerCase()
+		if (["0", "false", "no", "off"].includes(normalized)) return false
+		if (["1", "true", "yes", "on"].includes(normalized)) return true
+	}
+	return fallback
+}
+
+/** Cache, ledger and routing settings. Pure, so the precedence is testable. */
+export function resolveStateOptions(
+	options: Readonly<Record<string, any>>,
+	env: Readonly<Record<string, string | undefined>>,
+): StateOptions {
+	return {
+		cacheEnabled: flagDefaultOn(options.cacheEnabled, env.RESEARCH_CACHE_ENABLED, true),
+		cacheTtlMs: positiveNumber(options.cacheTtlMs, env.RESEARCH_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS),
+		cacheMaxEntries: positiveNumber(
+			options.cacheMaxEntries,
+			env.RESEARCH_CACHE_MAX_ENTRIES,
+			DEFAULT_CACHE_MAX_ENTRIES,
+		),
+		ledgerMaxEntries: positiveNumber(
+			options.ledgerMaxEntries,
+			env.RESEARCH_LEDGER_MAX_ENTRIES,
+			DEFAULT_LEDGER_MAX_ENTRIES,
+		),
+		routingAlways: flagDefaultOn(options.routingAlways, env.RESEARCH_ROUTING_ALWAYS, false),
+		injectRouting: options.injectRouting !== false,
+	}
+}
+
+export type RoutingMode = "none" | "routing" | "contract+routing"
+
+/**
+ * The routing block is a permanent tax on every model call, so it is injected
+ * only where it can change behaviour: an active brief, or routingAlways.
+ */
+export function routingMode(input: {
+	readonly hasBrief: boolean
+	readonly routingAlways: boolean
+	readonly injectRouting: boolean
+}): RoutingMode {
+	if (!input.injectRouting) return "none"
+	if (input.hasBrief) return "contract+routing"
+	return input.routingAlways ? "routing" : "none"
+}
+
 const briefStorageKey = (sessionID: string): string => `${BRIEF_STORAGE_PREFIX}${sessionID}`
 
 export const internals = {
@@ -159,22 +265,43 @@ export const internals = {
 	describeError,
 	briefStorageKey,
 	resolveConfig,
+	resolveStateOptions,
+	routingMode,
 	buildRoutingText,
 	buildResearchContract,
 	formatSearchResults,
+	formatMergedSearchResults,
 	formatPageResult,
 	formatCrawlResults,
 	formatExtractResult,
 	formatSourceList,
+	formatSourceLedger,
+	formatStats,
+	formatCacheNote,
 	exaWindowDays,
 	truncate,
+	// state helpers, re-exported so tests cover one import surface
+	appendSource,
+	cacheEntryKey,
+	emptyLedger,
+	emptyStats,
+	isCachedPage,
+	isCacheFresh,
+	isResearchStats,
+	isSessionLedger,
+	sourceStorageKey,
+	statsStorageKey,
 }
 
 export default Plugin.define({
 	id: "research",
 	async setup(ctx) {
 		const options = (ctx.options ?? {}) as Readonly<Record<string, any>>
-		const cfg: ResearchConfig = resolveConfig(options, process.env)
+		const cfg: ResearchConfig = {
+			...resolveConfig(options, process.env),
+			retryLog: (message: string) => console.log(`[research] ${message}`),
+		}
+		const state = resolveStateOptions(options, process.env)
 
 		const log = {
 			info: (message: string) => console.log(`[research] ${message}`),
@@ -231,6 +358,233 @@ export default Plugin.define({
 			log.warn(`research brief rehydration failed: ${describeError(error)}`)
 		}
 
+		// ---- read cache ------------------------------------------------------
+		// Stored in ctx.storage, keyed by backend + url + output-shaping options.
+		// A cache failure is never a read failure: every path falls back to a fetch.
+		const cacheRead = async (
+			candidates: readonly Backend[],
+			url: string,
+			cacheOptions: {
+				format?: string
+				targetSelector?: string
+				removeSelector?: string
+				withLinksSummary?: boolean
+				onlyMainContent?: boolean
+			},
+		): Promise<CachedPage | undefined> => {
+			if (!state.cacheEnabled) return undefined
+			for (const backend of candidates) {
+				try {
+					const raw = await ctx.storage.get(cacheEntryKey(backend, url, cacheOptions))
+					if (!isCachedPage(raw)) continue
+					if (!isCacheFresh(raw.fetchedAt, state.cacheTtlMs)) {
+						await ctx.storage.remove(cacheEntryKey(backend, url, cacheOptions)).catch(() => undefined)
+						continue
+					}
+					return raw
+				} catch (error) {
+					log.warn(`read cache lookup failed: ${describeError(error)}`)
+					return undefined
+				}
+			}
+			return undefined
+		}
+
+		let cacheEntryCount = 0
+
+		const pruneCache = async (): Promise<void> => {
+			let after: string | undefined
+			let remaining = 0
+			for (;;) {
+				const page = await ctx.storage.scan({ prefix: CACHE_STORAGE_PREFIX, after, limit: 100 })
+				for (const entry of page.entries) {
+					if (isCachedPage(entry.value) && isCacheFresh(entry.value.fetchedAt, state.cacheTtlMs)) {
+						remaining += 1
+						continue
+					}
+					try {
+						await ctx.storage.remove(entry.key)
+					} catch (error) {
+						log.warn(`could not drop a stale cache entry: ${describeError(error)}`)
+					}
+				}
+				if (!page.next) break
+				after = page.next
+			}
+			cacheEntryCount = remaining
+		}
+
+		// Count the cache at startup and drop what expired while the plugin was
+		// down, so the cap reflects more than this process's writes.
+		if (state.cacheEnabled) await pruneCache()
+
+		const cacheWrite = async (
+			page: PageResult,
+			backend: Backend,
+			url: string,
+			cacheOptions: {
+				format?: string
+				targetSelector?: string
+				removeSelector?: string
+				withLinksSummary?: boolean
+				onlyMainContent?: boolean
+			},
+		): Promise<void> => {
+			if (!state.cacheEnabled) return
+			try {
+				const entry: CachedPage = { ...page, backend, fetchedAt: Date.now() }
+				await ctx.storage.set(cacheEntryKey(backend, url, cacheOptions), storageJson(entry))
+				cacheEntryCount += 1
+				if (cacheEntryCount > state.cacheMaxEntries) await pruneCache()
+			} catch (error) {
+				log.warn(`could not cache the page: ${describeError(error)}`)
+			}
+		}
+
+		// ---- source ledger ---------------------------------------------------
+		// Per session, capped, and never allowed to break a tool call.
+		const ledgers = new Map<string, SessionLedger>()
+		const loadLedger = async (sessionID: string): Promise<SessionLedger> => {
+			const existing = ledgers.get(sessionID)
+			if (existing) return existing
+			try {
+				const raw = await ctx.storage.get(sourceStorageKey(sessionID))
+				if (isSessionLedger(raw)) {
+					ledgers.set(sessionID, raw)
+					return raw
+				}
+			} catch (error) {
+				log.warn(`could not load the source ledger: ${describeError(error)}`)
+			}
+			const fresh = emptyLedger(sessionID)
+			ledgers.set(sessionID, fresh)
+			return fresh
+		}
+
+		const persistLedger = async (ledger: SessionLedger): Promise<void> => {
+			ledgers.set(ledger.sessionID, ledger)
+			await ctx.storage.set(sourceStorageKey(ledger.sessionID), {
+				sessionID: ledger.sessionID,
+				entries: ledger.entries.map((entry) => ({ ...entry })),
+				dropped: ledger.dropped,
+			})
+		}
+
+		const recordSources = async (sessionID: string, entries: readonly SourceEntry[]): Promise<void> => {
+			if (!entries.length) return
+			try {
+				let ledger = await loadLedger(sessionID)
+				for (const entry of entries) ledger = appendSource(ledger, entry, state.ledgerMaxEntries)
+				await persistLedger(ledger)
+			} catch (error) {
+				log.warn(`could not record sources: ${describeError(error)}`)
+			}
+		}
+
+		const sourceEntry = (
+			url: string,
+			title: string,
+			backend: Backend,
+			content: string,
+		): SourceEntry => ({
+			url,
+			title,
+			backend,
+			readAt: Date.now(),
+			excerpt: content.replace(/\s+/g, " ").trim().slice(0, LEDGER_EXCERPT_CHARS),
+		})
+
+		// ---- session stats ---------------------------------------------------
+		// Counts only: no query text, no credentials. Durable per session, plus a
+		// lifetime total, so a config change can be judged against a baseline.
+		const statsBySession = new Map<string, ResearchStats>()
+		let lifetimeStats: ResearchStats | undefined
+
+		const loadStats = async (sessionID: string): Promise<ResearchStats> => {
+			const existing = statsBySession.get(sessionID)
+			if (existing) return existing
+			try {
+				const raw = await ctx.storage.get(statsStorageKey(sessionID))
+				if (isResearchStats(raw)) {
+					statsBySession.set(sessionID, raw)
+					return raw
+				}
+			} catch (error) {
+				log.warn(`could not load session stats: ${describeError(error)}`)
+			}
+			const fresh = emptyStats(sessionID)
+			statsBySession.set(sessionID, fresh)
+			return fresh
+		}
+
+		const loadLifetimeStats = async (): Promise<ResearchStats> => {
+			if (lifetimeStats) return lifetimeStats
+			try {
+				const raw = await ctx.storage.get(statsStorageKey(LIFETIME_STATS_ID))
+				if (isResearchStats(raw) && raw.sessionID === LIFETIME_STATS_ID) {
+					lifetimeStats = raw
+					return raw
+				}
+			} catch (error) {
+				log.warn(`could not load lifetime stats: ${describeError(error)}`)
+			}
+			lifetimeStats = emptyStats(LIFETIME_STATS_ID)
+			return lifetimeStats
+		}
+
+		const count = async (sessionID: string, mutate: (stats: ResearchStats) => void): Promise<void> => {
+			try {
+				const stats = await loadStats(sessionID)
+				mutate(stats)
+				stats.updatedAt = Date.now()
+				await ctx.storage.set(statsStorageKey(sessionID), storageJson(stats))
+				const lifetime = await loadLifetimeStats()
+				mutate(lifetime)
+				lifetime.updatedAt = Date.now()
+				await ctx.storage.set(statsStorageKey(LIFETIME_STATS_ID), storageJson(lifetime))
+			} catch (error) {
+				log.warn(`could not update research stats: ${describeError(error)}`)
+			}
+		}
+
+		interface Step<T> {
+			backend: Backend
+			run: () => Promise<T>
+		}
+
+		/** Count a call, and its failure, without changing what the tool returns. */
+		const instrument = <T>(sessionID: string, steps: ReadonlyArray<Step<T>>): Step<T>[] =>
+			steps.map((step) => ({
+				backend: step.backend,
+				run: async () => {
+					try {
+						const value = await step.run()
+						await count(sessionID, (stats) => {
+							stats.backends[step.backend].calls += 1
+						})
+						return value
+					} catch (error) {
+						await count(sessionID, (stats) => {
+							stats.backends[step.backend].calls += 1
+							stats.backends[step.backend].failures += 1
+						})
+						throw error
+					}
+				},
+			}))
+
+		const countAnswer = async (
+			sessionID: string,
+			backend: Backend,
+			resultCount: number,
+			usedFallback: boolean,
+		): Promise<void> => {
+			await count(sessionID, (stats) => {
+				stats.backends[backend].results += resultCount
+				if (usedFallback) stats.backends[backend].fallbacks += 1
+			})
+		}
+
 		// ---- tools ------------------------------------------------------------
 		await ctx.tool.transform((editor) => {
 			editor.namespace({
@@ -243,7 +597,7 @@ export default Plugin.define({
 			editor.add({
 				name: "search",
 				description:
-					"Find candidate sources on the public web. Use this first, before reading anything. Tavily handles natural-language queries, news and finance topics, domain filters and time ranges; Exa handles conceptual, academic and technical queries with neural search; Jina search is the last-resort fallback. Returns titles, URLs and snippets.",
+					"Find candidate sources on the public web. Use this first, before reading anything. Tavily handles natural-language queries, news and finance topics, domain filters and time ranges; Exa handles conceptual, academic and technical queries with neural search; Jina search is the last-resort fallback. mode \"merge\" queries two engines and combines the union, which costs a second call but removes one engine's blind spot. Returns titles, URLs and snippets.",
 				input: {
 					type: "object",
 					properties: {
@@ -253,6 +607,16 @@ export default Plugin.define({
 							enum: ["auto", "neural", "keyword"],
 							description:
 								"auto = Tavily first, then Exa, then Jina. neural = Exa semantic search first, best for conceptual, academic and technical queries. keyword = literal matching first. Default auto.",
+						},
+						mode: {
+							type: "string",
+							enum: ["auto", "merge"],
+							description:
+								"auto = first engine that answers wins. merge = query several engines and return the deduplicated union, labelled by engine. Default auto.",
+						},
+						maxEngines: {
+							type: "integer",
+							description: "For mode merge: how many engines may take part (default 2, max 3).",
 						},
 						maxResults: { type: "integer", description: "How many results to return (default 8, max 20)." },
 						depth: {
@@ -296,19 +660,32 @@ export default Plugin.define({
 				options: { namespace: NAMESPACE, codemode: true },
 				async execute(input, toolCtx) {
 					const args = (input ?? {}) as Record<string, unknown>
+					const sessionID = toolCtx.sessionID
 					const query = asString(args.query)
 					if (!query) return { content: "research_search: `query` is required." }
 					const maxResults = asNumber(args.maxResults) ?? 8
 					const includeDomains = asStringArray(args.includeDomains)
 					const excludeDomains = asStringArray(args.excludeDomains)
 					const engine = args.engine === "neural" || args.engine === "keyword" ? args.engine : "auto"
+					const merge = args.mode === "merge"
 
 					// Tavily takes a relative time window, Exa takes dates. Translate
 					// so the fallback search is not weaker than the primary one.
 					const windowDays = exaWindowDays(args)
 					const exaType = engine === "neural" ? "neural" : engine === "keyword" ? "keyword" : "auto"
+					const topic = args.topic === "news" || args.topic === "finance" ? args.topic : "general"
+					const timeRange =
+						args.timeRange === "day" || args.timeRange === "week" || args.timeRange === "month" || args.timeRange === "year"
+							? args.timeRange
+							: undefined
+					const requestedFilters = {
+						timeRange,
+						days: asNumber(args.days),
+						includeAnswer: args.includeAnswer,
+						topic,
+					}
 
-					const tavilyStep = (): { backend: Backend; run: () => Promise<SearchOutcome> } => ({
+					const tavilyStep = (): Step<SearchOutcome> => ({
 						backend: "tavily",
 						run: () =>
 							tavilySearch(
@@ -317,11 +694,8 @@ export default Plugin.define({
 									query,
 									maxResults,
 									depth: args.depth === "advanced" ? "advanced" : "basic",
-									topic: args.topic === "news" || args.topic === "finance" ? args.topic : "general",
-									timeRange:
-										args.timeRange === "day" || args.timeRange === "week" || args.timeRange === "month" || args.timeRange === "year"
-											? args.timeRange
-											: undefined,
+									topic,
+									timeRange,
 									days: asNumber(args.days),
 									includeDomains,
 									excludeDomains,
@@ -331,7 +705,7 @@ export default Plugin.define({
 								toolCtx.signal,
 							),
 					})
-					const exaStep = (): { backend: Backend; run: () => Promise<SearchOutcome> } => ({
+					const exaStep = (): Step<SearchOutcome> => ({
 						backend: "exa",
 						run: () =>
 							exaSearch(
@@ -348,28 +722,72 @@ export default Plugin.define({
 								toolCtx.signal,
 							),
 					})
-					const jinaStep = (): { backend: Backend; run: () => Promise<SearchOutcome> } => ({
+					const jinaStep = (): Step<SearchOutcome> => ({
 						backend: "jina",
-						run: () => jinaSearch(cfg, query, maxResults, toolCtx.signal),
+						run: () =>
+							jinaSearch(
+								cfg,
+								{ query, limit: maxResults, includeDomains, excludeDomains },
+								toolCtx.signal,
+							),
 					})
 
-					const steps: { backend: Backend; run: () => Promise<SearchOutcome> }[] = []
-					if (engine === "neural") {
-						if (available.exa) steps.push(exaStep())
-						if (available.tavily) steps.push(tavilyStep())
-					} else if (engine === "keyword") {
-						if (available.tavily) steps.push(tavilyStep())
-						if (available.exa) steps.push(exaStep())
-					} else {
-						if (available.tavily) steps.push(tavilyStep())
-						if (available.exa) steps.push(exaStep())
+					const ordered = (): Step<SearchOutcome>[] => {
+						const steps: Step<SearchOutcome>[] = []
+						if (engine === "neural") {
+							if (available.exa) steps.push(exaStep())
+							if (available.tavily) steps.push(tavilyStep())
+						} else {
+							if (available.tavily) steps.push(tavilyStep())
+							if (available.exa) steps.push(exaStep())
+						}
+						steps.push(jinaStep())
+						return steps
 					}
-					steps.push(jinaStep())
 
-					try {
-						const { value, notes } = await route(steps)
+					// -- merged search: union of several engines, not one engine's view.
+					if (merge) {
+						const candidates = ordered()
+						const maxEngines = clamp(asNumber(args.maxEngines) ?? 2, 1, candidates.length)
+						const chosen = candidates.slice(0, maxEngines)
+						const settled = await Promise.allSettled(chosen.map((step) => step.run()))
+						const lists: { backend: Backend; results: SearchOutcome["results"] }[] = []
+						const failed: { backend: Backend; error: string }[] = []
+						for (let index = 0; index < settled.length; index += 1) {
+							const step = chosen[index]
+							const result = settled[index]
+							if (result.status === "fulfilled") {
+								lists.push({ backend: step.backend, results: result.value.results })
+								await count(sessionID, (stats) => {
+									stats.backends[step.backend].calls += 1
+									stats.backends[step.backend].results += result.value.results.length
+								})
+							} else {
+								failed.push({ backend: step.backend, error: describeError(result.reason) })
+								await count(sessionID, (stats) => {
+									stats.backends[step.backend].calls += 1
+									stats.backends[step.backend].failures += 1
+								})
+							}
+						}
+						const merged: MergedSearchOutcome = { ...mergeSearchResults(lists), failed }
+						const unsupported = [
+							...new Set(merged.answered.flatMap((backend) => describeUnsupportedFilters(backend, requestedFilters))),
+						]
 						return {
-							content: formatSearchResults(value, query, maxResults) + notesSuffix(notes),
+							content:
+								formatMergedSearchResults(merged, query, maxResults) +
+								(unsupported.length ? `\n${unsupported.map((note) => `note: ${note}`).join("\n")}` : ""),
+						}
+					}
+
+					const steps = instrument(sessionID, ordered())
+					try {
+						const { value, backend, notes } = await route(steps)
+						await countAnswer(sessionID, backend, value.results.length, notes.length > 0)
+						const unsupported = describeUnsupportedFilters(backend, requestedFilters)
+						return {
+							content: formatSearchResults(value, query, maxResults, unsupported) + notesSuffix(notes),
 						}
 					} catch (error) {
 						return { content: `research_search failed: ${describeError(error)}` }
@@ -408,6 +826,7 @@ export default Plugin.define({
 				options: { namespace: NAMESPACE, codemode: true },
 				async execute(input, toolCtx) {
 					const args = (input ?? {}) as Record<string, unknown>
+					const sessionID = toolCtx.sessionID
 					const rawUrl = asString(args.url)
 					if (!rawUrl) return { content: "research_find_similar: `url` is required." }
 					if (!available.exa) {
@@ -434,12 +853,37 @@ export default Plugin.define({
 							},
 							toolCtx.signal,
 						)
+						await count(sessionID, (stats) => {
+							stats.backends.exa.calls += 1
+							stats.backends.exa.results += outcome.results.length
+						})
 						return {
 							content: formatSearchResults(outcome, `pages like ${url.toString()}`, asNumber(args.maxResults) ?? 8),
 						}
 					} catch (error) {
+						await count(sessionID, (stats) => {
+							stats.backends.exa.calls += 1
+							stats.backends.exa.failures += 1
+						})
 						return { content: `research_find_similar failed: ${describeError(error)}` }
 					}
+				},
+			})
+
+			// -- the source ledger -----------------------------------------------
+			editor.add({
+				name: "sources",
+				description:
+					"List the sources actually read in this session, with the backend and time. A storage read only, no network call. Use it before writing the final source list: a URL that is not in this list was not read.",
+				input: {
+					type: "object",
+					properties: {},
+					additionalProperties: false,
+				},
+				options: { namespace: NAMESPACE, codemode: true },
+				async execute(_input, toolCtx) {
+					const ledger = await loadLedger(toolCtx.sessionID)
+					return { content: formatSourceLedger(ledger) }
 				},
 			})
 
@@ -447,7 +891,7 @@ export default Plugin.define({
 			editor.add({
 				name: "read",
 				description:
-					"Read ONE URL and return it as clean markdown. Use after research_search, on the URLs that look worth reading. Firecrawl renders JavaScript and handles PDFs; the Jina reader is the fallback and needs no API key, so this route always works.",
+					"Read ONE URL and return it as clean markdown. Use after research_search, on the URLs that look worth reading. Firecrawl renders JavaScript and handles PDFs; the Jina reader is the fallback and needs no API key, so this route always works. A page read in the last 24 hours is served from the cache; the output says so.",
 				input: {
 					type: "object",
 					properties: {
@@ -481,6 +925,7 @@ export default Plugin.define({
 				options: { namespace: NAMESPACE, codemode: true },
 				async execute(input, toolCtx) {
 					const args = (input ?? {}) as Record<string, unknown>
+					const sessionID = toolCtx.sessionID
 					const rawUrl = asString(args.url)
 					if (!rawUrl) return { content: "research_read: `url` is required." }
 					let url: URL
@@ -492,8 +937,15 @@ export default Plugin.define({
 					const target = url.toString()
 					const maxChars = asNumber(args.maxChars) ?? DEFAULT_READ_CHARS
 					const format = args.format === "text" || args.format === "html" ? args.format : "markdown"
+					const cacheOptions = {
+						format,
+						targetSelector: asString(args.targetSelector),
+						removeSelector: asString(args.removeSelector),
+						withLinksSummary: args.includeLinks === true,
+						onlyMainContent: args.onlyMainContent !== false,
+					}
 
-					const steps: { backend: Backend; run: () => Promise<PageResult> }[] = []
+					const steps: Step<PageResult>[] = []
 					if (available.firecrawl) {
 						steps.push({
 							backend: "firecrawl",
@@ -501,7 +953,7 @@ export default Plugin.define({
 								firecrawlScrape(
 									cfg,
 									target,
-									{ format, onlyMainContent: args.onlyMainContent !== false },
+									{ format, onlyMainContent: cacheOptions.onlyMainContent },
 									toolCtx.signal,
 								),
 						})
@@ -514,16 +966,35 @@ export default Plugin.define({
 								target,
 								{
 									format,
-									targetSelector: asString(args.targetSelector),
-									removeSelector: asString(args.removeSelector),
-									withLinksSummary: args.includeLinks === true,
+									targetSelector: cacheOptions.targetSelector,
+									removeSelector: cacheOptions.removeSelector,
+									withLinksSummary: cacheOptions.withLinksSummary,
 								},
 								toolCtx.signal,
 							),
 					})
 
+					const cached = await cacheRead(steps.map((step) => step.backend), target, cacheOptions)
+					if (cached) {
+						await count(sessionID, (stats) => {
+							stats.cacheHits += 1
+						})
+						return {
+							content:
+								formatPageResult(cached, maxChars) +
+								`\n\n${formatCacheNote(cached.fetchedAt, cached.backend)}`,
+						}
+					}
+
 					try {
-						const { value, notes } = await route(steps)
+						const { value, backend, notes } = await route(instrument(sessionID, steps))
+						await cacheWrite(value, backend, target, cacheOptions)
+						await recordSources(sessionID, [sourceEntry(value.url || target, value.title, backend, value.content)])
+						await count(sessionID, (stats) => {
+							stats.pagesRead += 1
+							stats.backends[backend].results += 1
+							stats.charsReturned += value.content.length
+						})
 						return { content: formatPageResult(value, maxChars) + notesSuffix(notes) }
 					} catch (error) {
 						return { content: `research_read failed: ${describeError(error)}` }
@@ -561,6 +1032,7 @@ export default Plugin.define({
 				options: { namespace: NAMESPACE, codemode: true },
 				async execute(input, toolCtx) {
 					const args = (input ?? {}) as Record<string, unknown>
+					const sessionID = toolCtx.sessionID
 					const rawUrl = asString(args.url)
 					if (!rawUrl) return { content: "research_crawl: `url` is required." }
 					if (!available.firecrawl) {
@@ -576,7 +1048,7 @@ export default Plugin.define({
 						return { content: `research_crawl: ${describeError(error)}` }
 					}
 					try {
-						const pages = await firecrawlCrawl(
+						const outcome = await firecrawlCrawl(
 							cfg,
 							url.toString(),
 							{
@@ -588,9 +1060,25 @@ export default Plugin.define({
 							},
 							toolCtx.signal,
 						)
+						await count(sessionID, (stats) => {
+							stats.backends.firecrawl.calls += 1
+							stats.backends.firecrawl.results += outcome.length
+							stats.pagesCrawled += outcome.length
+							stats.charsReturned += outcome.reduce((total, page) => total + page.content.length, 0)
+						})
+						await recordSources(
+							sessionID,
+							outcome
+								.filter((page) => page.url)
+								.map((page) => sourceEntry(page.url, page.title, "firecrawl", page.content)),
+						)
 						const maxChars = asNumber(args.maxCharsPerPage) ?? DEFAULT_CRAWL_PAGE_CHARS
-						return { content: formatCrawlResults(pages, url.toString(), maxChars) }
+						return { content: formatCrawlResults(outcome, url.toString(), maxChars) }
 					} catch (error) {
+						await count(sessionID, (stats) => {
+							stats.backends.firecrawl.calls += 1
+							stats.backends.firecrawl.failures += 1
+						})
 						return { content: `research_crawl failed: ${describeError(error)}` }
 					}
 				},
@@ -619,6 +1107,7 @@ export default Plugin.define({
 				options: { namespace: NAMESPACE, codemode: true },
 				async execute(input, toolCtx) {
 					const args = (input ?? {}) as Record<string, unknown>
+					const sessionID = toolCtx.sessionID
 					const rawUrl = asString(args.url)
 					if (!rawUrl) return { content: "research_map: `url` is required." }
 					let url: URL
@@ -628,7 +1117,7 @@ export default Plugin.define({
 						return { content: `research_map: ${describeError(error)}` }
 					}
 					const target = url.toString()
-					const steps: { backend: Backend; run: () => Promise<string[]> }[] = []
+					const steps: Step<string[]>[] = []
 					if (available.tavily) {
 						steps.push({
 							backend: "tavily",
@@ -664,7 +1153,8 @@ export default Plugin.define({
 						return { content: "research_map: needs a Tavily or Firecrawl API key." }
 					}
 					try {
-						const { value, backend, notes } = await route(steps)
+						const { value, backend, notes } = await route(instrument(sessionID, steps))
+						await countAnswer(sessionID, backend, value.length, notes.length > 0)
 						const body = value.length
 							? value.map((entry) => `- ${entry}`).join("\n")
 							: "(no URLs found)"
@@ -712,6 +1202,7 @@ export default Plugin.define({
 				options: { namespace: NAMESPACE, codemode: true },
 				async execute(input, toolCtx) {
 					const args = (input ?? {}) as Record<string, unknown>
+					const sessionID = toolCtx.sessionID
 					const rawUrls = asStringArray(args.urls)
 					if (!rawUrls) return { content: "research_extract: `urls` must be a non-empty array of URLs." }
 					const urls: string[] = []
@@ -730,7 +1221,7 @@ export default Plugin.define({
 						return { content: "research_extract: give either a `schema` or a `prompt` describing what to extract." }
 					}
 
-					const steps: { backend: Backend; run: () => Promise<ExtractOutcome> }[] = []
+					const steps: Step<ExtractOutcome>[] = []
 					if (available.firecrawl) {
 						steps.push({
 							backend: "firecrawl",
@@ -747,9 +1238,19 @@ export default Plugin.define({
 						return { content: "research_extract: needs a Firecrawl or Tavily API key." }
 					}
 					try {
-						const { value, notes } = await route(steps)
+						const { value, backend, notes } = await route(instrument(sessionID, steps))
 						const maxChars = asNumber(args.maxChars) ?? DEFAULT_EXTRACT_CHARS
-						return { content: formatExtractResult(value, maxChars) + notesSuffix(notes) }
+						const body = formatExtractResult(value, maxChars)
+						await count(sessionID, (stats) => {
+							stats.urlsExtracted += urls.length
+							stats.backends[backend].results += urls.length
+							stats.charsReturned += body.length
+						})
+						await recordSources(
+							sessionID,
+							urls.map((target) => sourceEntry(target, "", backend, "")),
+						)
+						return { content: body + notesSuffix(notes) }
 					} catch (error) {
 						return { content: `research_extract failed: ${describeError(error)}` }
 					}
@@ -769,8 +1270,14 @@ export default Plugin.define({
 						await ctx.session.prompt({
 							sessionID,
 							delivery,
-							text: "Usage: /research <question>",
+							text: "Usage: /research <question>\n       /research stats",
 						})
+						return
+					}
+					if (/^stats$/i.test(question)) {
+						const stats = await loadStats(sessionID)
+						const lifetime = await loadLifetimeStats()
+						await ctx.session.prompt({ sessionID, delivery, text: formatStats(stats, lifetime) })
 						return
 					}
 					const brief: ResearchBrief = { sessionID, question, createdAt: Date.now() }
@@ -786,15 +1293,21 @@ export default Plugin.define({
 		})
 
 		// ---- session hooks ----------------------------------------------------
-		// The routing block is the deliverable: it tells the model which backend
-		// fits which job. It is rebuilt from the configured backends, so a route
-		// without a credential is never advertised.
+		// The routing block is rebuilt from the configured backends, so a route
+		// without a credential is never advertised. It rides only where it can
+		// change behaviour: a session with an active brief, or routingAlways.
 		const hookRegistrations: { dispose: () => Promise<void> }[] = []
 
-		if (options.injectRouting !== false) {
+		if (state.injectRouting) {
 			hookRegistrations.push(
 				await ctx.session.hook("context", (event) => {
 					const brief = briefs.get(event.sessionID)
+					const mode = routingMode({
+						hasBrief: !!brief,
+						routingAlways: state.routingAlways,
+						injectRouting: state.injectRouting,
+					})
+					if (mode === "none") return
 					const parts: string[] = []
 					if (brief) parts.push(buildResearchContract(brief.question))
 					parts.push(routingText)
@@ -822,14 +1335,24 @@ export default Plugin.define({
 			}),
 		)
 
-		// A deleted session takes its brief with it.
+		// A deleted session takes its brief, ledger and counters with it.
 		const eventController = new AbortController()
 		void (async () => {
 			for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
 				if (event.type !== "session.deleted") continue
 				const data = (event as { data?: Record<string, unknown> }).data ?? {}
 				const sessionID = data.sessionID as string | undefined
-				if (sessionID && briefs.has(sessionID)) await dropBrief(sessionID)
+				if (!sessionID) continue
+				if (briefs.has(sessionID)) await dropBrief(sessionID)
+				ledgers.delete(sessionID)
+				statsBySession.delete(sessionID)
+				for (const key of [sourceStorageKey(sessionID), statsStorageKey(sessionID)]) {
+					try {
+						await ctx.storage.remove(key)
+					} catch (error) {
+						log.warn(`could not remove ${key}: ${describeError(error)}`)
+					}
+				}
 			}
 		})().catch((error) => log.warn(`event loop stopped: ${describeError(error)}`))
 
@@ -861,7 +1384,9 @@ export default Plugin.define({
 		}
 
 		log.info(
-			`ready (tavily: ${available.tavily ? "yes" : "no"}, firecrawl: ${available.firecrawl ? "yes" : "no"}, jina: yes)`,
+			`ready (tavily: ${available.tavily ? "yes" : "no"}, exa: ${available.exa ? "yes" : "no"}, firecrawl: ${
+				available.firecrawl ? "yes" : "no"
+			}, jina: yes, cache: ${state.cacheEnabled ? "on" : "off"})`,
 		)
 
 		return async () => {
@@ -875,6 +1400,8 @@ export default Plugin.define({
 			}
 			// Durable briefs survive restarts; only the in-memory index is cleared.
 			briefs.clear()
+			ledgers.clear()
+			statsBySession.clear()
 		}
 	},
 })

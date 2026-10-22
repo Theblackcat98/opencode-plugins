@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { internals } from "./index.js"
-import { INTERNALS as PROVIDER_INTERNALS, InputError, assertWebUrl, isPrivateHostname } from "./providers.js"
+import { INTERNALS as PROVIDER_INTERNALS, InputError, ProviderError, assertWebUrl, isPrivateHostname } from "./providers.js"
 
 describe("config resolution", () => {
 	test("plugin options win over environment variables", () => {
@@ -38,6 +38,107 @@ describe("config resolution", () => {
 	test("blank option and env values are ignored", () => {
 		const cfg = internals.resolveConfig({ tavilyKey: "   " }, { TAVILY_API_KEY: "" })
 		expect(cfg.tavilyKey).toBeUndefined()
+	})
+
+	test("retry settings default to two retries with a one second base delay", () => {
+		const cfg = internals.resolveConfig({}, {})
+		expect(cfg.retryAttempts).toBe(2)
+		expect(cfg.retryBaseDelayMs).toBe(1000)
+	})
+
+	test("retry settings can be zero, or come from the environment", () => {
+		expect(internals.resolveConfig({ retryAttempts: 0 }, {}).retryAttempts).toBe(0)
+		const cfg = internals.resolveConfig({}, { RESEARCH_RETRY_ATTEMPTS: "4", RESEARCH_RETRY_BASE_DELAY_MS: "250" })
+		expect(cfg.retryAttempts).toBe(4)
+		expect(cfg.retryBaseDelayMs).toBe(250)
+	})
+})
+
+describe("provider retry", () => {
+	const base = internals.resolveConfig({}, {})
+	const cfg = { ...base, retryBaseDelayMs: 1, requestTimeoutMs: 50 }
+
+	test("only 429 and 5xx are retryable", () => {
+		for (const status of [429, 500, 502, 503, 599]) expect(PROVIDER_INTERNALS.isRetryableStatus(status)).toBe(true)
+		for (const status of [400, 401, 403, 404, 422, 200]) expect(PROVIDER_INTERNALS.isRetryableStatus(status)).toBe(false)
+		expect(PROVIDER_INTERNALS.isRetryableStatus(undefined)).toBe(false)
+	})
+
+	test("Retry-After accepts seconds and HTTP dates", () => {
+		expect(PROVIDER_INTERNALS.parseRetryAfter("2")).toBe(2000)
+		expect(PROVIDER_INTERNALS.parseRetryAfter("0.5")).toBe(500)
+		expect(PROVIDER_INTERNALS.parseRetryAfter("Wed, 21 Oct 2026 10:00:05 GMT", Date.parse("2026-10-21T10:00:00Z"))).toBe(5000)
+		expect(PROVIDER_INTERNALS.parseRetryAfter("nonsense")).toBeUndefined()
+		expect(PROVIDER_INTERNALS.parseRetryAfter(null)).toBeUndefined()
+	})
+
+	test("the delay is exponential, jittered and capped", () => {
+		expect(PROVIDER_INTERNALS.retryDelayMs(1, undefined, 1000, 60_000, () => 0)).toBe(1000)
+		expect(PROVIDER_INTERNALS.retryDelayMs(2, undefined, 1000, 60_000, () => 0)).toBe(4000)
+		expect(PROVIDER_INTERNALS.retryDelayMs(1, undefined, 1000, 60_000, () => 1)).toBe(1250)
+		expect(PROVIDER_INTERNALS.retryDelayMs(1, 500, 1000, 60_000, () => 0)).toBe(500)
+		expect(PROVIDER_INTERNALS.retryDelayMs(1, 999_999, 1000, 60_000, () => 0)).toBe(60_000)
+	})
+
+	test("a 429 then a 200 succeeds on the second attempt", async () => {
+		const original = globalThis.fetch
+		let calls = 0
+		globalThis.fetch = (async () => {
+			calls += 1
+			if (calls === 1) return new Response("rate limited", { status: 429, headers: { "retry-after": "0" } })
+			return new Response(JSON.stringify({ ok: true }), { status: 200 })
+		}) as unknown as typeof fetch
+		try {
+			const body = await PROVIDER_INTERNALS.fetchJson("jina", "https://example.test", {}, cfg)
+			expect(body).toEqual({ ok: true })
+			expect(calls).toBe(2)
+		} finally {
+			globalThis.fetch = original
+		}
+	})
+
+	test("a 400 is not retried", async () => {
+		const original = globalThis.fetch
+		let calls = 0
+		globalThis.fetch = (async () => {
+			calls += 1
+			return new Response("bad request", { status: 400 })
+		}) as unknown as typeof fetch
+		try {
+			await expect(PROVIDER_INTERNALS.fetchJson("jina", "https://example.test", {}, cfg)).rejects.toMatchObject({
+				status: 400,
+			})
+			expect(calls).toBe(1)
+		} finally {
+			globalThis.fetch = original
+		}
+	})
+
+	test("an aborted signal stops the retry loop at once", async () => {
+		const controller = new AbortController()
+		let calls = 0
+		await expect(
+			PROVIDER_INTERNALS.withRetry("jina", cfg, controller.signal, async () => {
+				calls += 1
+				controller.abort()
+				throw new Error("first attempt failed")
+			}),
+		).rejects.toThrow("first attempt failed")
+		expect(calls).toBe(1)
+	})
+
+	test("the retry is logged with the attempt and the status", async () => {
+		const messages: string[] = []
+		const logged = { ...cfg, retryAttempts: 1, retryLog: (message: string) => messages.push(message) }
+		let calls = 0
+		await PROVIDER_INTERNALS.withRetry("tavily", logged, undefined, async () => {
+			calls += 1
+			if (calls === 1) throw new ProviderError("tavily", "429 Too Many Requests", 429)
+			return "ok"
+		})
+		expect(calls).toBe(2)
+		expect(messages.join("\n")).toContain("retrying tavily")
+		expect(messages.join("\n")).toContain("status 429")
 	})
 })
 
@@ -341,5 +442,289 @@ describe("research briefs", () => {
 
 	test("brief storage keys are namespaced by session", () => {
 		expect(internals.briefStorageKey("ses_1")).toBe("research/brief/ses_1")
+	})
+})
+
+describe("Jina domain filters", () => {
+	test("a domain matches the exact host and its subdomains only", () => {
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("example.com", "example.com")).toBe(true)
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("docs.example.com", "example.com")).toBe(true)
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("EXAMPLE.COM", "example.com")).toBe(true)
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("example.com.", "example.com")).toBe(true)
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("example.com", "*.example.com")).toBe(true)
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("example.com.evil.net", "example.com")).toBe(false)
+		expect(PROVIDER_INTERNALS.hostMatchesDomain("notexample.com", "example.com")).toBe(false)
+	})
+
+	test("includeDomains keeps only the listed domains, excludeDomains drops them", () => {
+		const results = [
+			{ title: "A", url: "https://docs.example.com/a", snippet: "" },
+			{ title: "B", url: "https://other.test/b", snippet: "" },
+			{ title: "C", url: "https://example.com.evil.net/c", snippet: "" },
+		]
+		const included = PROVIDER_INTERNALS.filterResultsByDomain(results, { includeDomains: ["example.com"] })
+		expect(included.results.map((entry) => entry.title)).toEqual(["A"])
+		expect(included.removed).toBe(2)
+
+		const excluded = PROVIDER_INTERNALS.filterResultsByDomain(results, { excludeDomains: ["example.com"] })
+		expect(excluded.results.map((entry) => entry.title)).toEqual(["B", "C"])
+		expect(excluded.returned).toBe(3)
+		expect(excluded.removed).toBe(1)
+	})
+
+	test("a filter that removes everything reports the count", () => {
+		const outcome = PROVIDER_INTERNALS.filterResultsByDomain(
+			[
+				{ title: "A", url: "https://a.test", snippet: "" },
+				{ title: "B", url: "https://b.test", snippet: "" },
+			],
+			{ includeDomains: ["allowed.test"] },
+		)
+		expect(outcome.results).toEqual([])
+		expect(outcome.removed).toBe(2)
+		const text = internals.formatSearchResults({ backend: "jina", results: [], filter: outcome }, "q", 8)
+		expect(text).toContain("returned 2 result(s)")
+		expect(text).toContain("removed all of them")
+		expect(text).not.toContain("No results")
+	})
+
+	test("unsupported Jina filters are stated, and other backends have none", () => {
+		const notes = PROVIDER_INTERNALS.describeUnsupportedFilters("jina", {
+			timeRange: "week",
+			includeAnswer: true,
+			topic: "news",
+		})
+		expect(notes.join("\n")).toContain("time window")
+		expect(notes.join("\n")).toContain("generated answer")
+		expect(notes.join("\n")).toContain('"news"')
+		expect(PROVIDER_INTERNALS.describeUnsupportedFilters("tavily", { timeRange: "week" })).toEqual([])
+	})
+
+	test("unsupported notes ride along with the formatted results", () => {
+		const text = internals.formatSearchResults(
+			{ backend: "jina", results: [{ title: "A", url: "https://a.test", snippet: "s" }] },
+			"q",
+			8,
+			["jina search returns no generated answer"],
+		)
+		expect(text).toContain("note: jina search returns no generated answer")
+	})
+})
+
+describe("merged search", () => {
+	test("url normalization removes the parts that do not identify a page", () => {
+		expect(PROVIDER_INTERNALS.normalizeUrl("https://WWW.Example.com/path/?utm_source=x&b=2&a=1#frag")).toBe(
+			"example.com/path?a=1&b=2",
+		)
+		expect(PROVIDER_INTERNALS.normalizeUrl("https://example.com/")).toBe("example.com")
+		expect(PROVIDER_INTERNALS.normalizeUrl("https://example.com/path/")).toBe("example.com/path")
+		expect(PROVIDER_INTERNALS.normalizeUrl("https://example.com:443/x")).toBe("example.com/x")
+	})
+
+	test("the merged list keeps the first engine's order, then what the second adds", () => {
+		const merged = PROVIDER_INTERNALS.mergeSearchResults([
+			{
+				backend: "tavily",
+				results: [
+					{ title: "A", url: "https://a.test", snippet: "a" },
+					{ title: "B", url: "https://b.test", snippet: "b" },
+				],
+			},
+			{
+				backend: "exa",
+				results: [
+					{ title: "B again", url: "https://www.b.test/", snippet: "b2" },
+					{ title: "C", url: "https://c.test", snippet: "c" },
+				],
+			},
+		])
+		expect(merged.results.map((entry) => entry.url)).toEqual([
+			"https://a.test",
+			"https://b.test",
+			"https://c.test",
+		])
+		expect(merged.results[1].engines).toEqual(["tavily", "exa"])
+		expect(merged.results[1].positions).toEqual({ tavily: 2, exa: 1 })
+		expect(merged.results[0].engines).toEqual(["tavily"])
+		expect(merged.answered).toEqual(["tavily", "exa"])
+	})
+
+	test("a large rank gap between engines is reported as a disagreement", () => {
+		const merged = PROVIDER_INTERNALS.mergeSearchResults([
+			{
+				backend: "tavily",
+				results: Array.from({ length: 6 }, (_, index) => ({
+					title: `T${index}`,
+					url: `https://t${index}.test`,
+					snippet: "",
+				})),
+			},
+			{
+				backend: "exa",
+				results: [
+					...Array.from({ length: 5 }, (_, index) => ({
+						title: `E${index}`,
+						url: `https://e${index}.test`,
+						snippet: "",
+					})),
+					{ title: "far", url: "https://t0.test", snippet: "" },
+				],
+			},
+		])
+		expect(merged.disagreements.map((entry) => entry.url)).toEqual(["https://t0.test"])
+	})
+
+	test("the merged format names the engines, the labels and the failures", () => {
+		const text = internals.formatMergedSearchResults(
+			{
+				results: [
+					{
+						title: "A",
+						url: "https://a.test",
+						snippet: "s",
+						engines: ["tavily", "exa"],
+						positions: { tavily: 1, exa: 1 },
+					},
+				],
+				answered: ["tavily", "exa"],
+				failed: [{ backend: "jina", error: "429" }],
+				disagreements: [],
+			},
+			"q",
+			8,
+		)
+		expect(text).toContain("Merged search")
+		expect(text).toContain("tavily, exa")
+		expect(text).toContain("[tavily+exa]")
+		expect(text).toContain("jina failed: 429")
+	})
+})
+
+describe("read cache", () => {
+	test("the key covers the backend and every option that changes the text", () => {
+		const base = internals.cacheEntryKey("firecrawl", "https://a.test", { format: "markdown" })
+		expect(base.startsWith("research/cache/")).toBe(true)
+		expect(internals.cacheEntryKey("firecrawl", "https://a.test", { format: "markdown" })).toBe(base)
+		expect(internals.cacheEntryKey("jina", "https://a.test", { format: "markdown" })).not.toBe(base)
+		expect(internals.cacheEntryKey("jina", "https://a.test", { format: "text" })).not.toBe(base)
+		expect(internals.cacheEntryKey("jina", "https://a.test", { targetSelector: "#main" })).not.toBe(base)
+		expect(internals.cacheEntryKey("jina", "https://a.test", { removeSelector: "nav" })).not.toBe(base)
+		expect(internals.cacheEntryKey("jina", "https://a.test", { withLinksSummary: true })).not.toBe(base)
+	})
+
+	test("an entry older than the TTL is a miss", () => {
+		const now = Date.parse("2026-10-21T12:00:00Z")
+		expect(internals.isCacheFresh(now - 1000, 60_000, now)).toBe(true)
+		expect(internals.isCacheFresh(now - 120_000, 60_000, now)).toBe(false)
+	})
+
+	test("the cache note says it is cached and how old it is", () => {
+		const now = Date.parse("2026-10-21T12:00:00Z")
+		const note = internals.formatCacheNote(now - 2 * 60 * 60 * 1000, "firecrawl", now)
+		expect(note).toContain("cached")
+		expect(note).toContain("2 hour(s)")
+		expect(note).toContain("firecrawl")
+	})
+
+	test("cache settings resolve from options, then env, then defaults", () => {
+		const defaults = internals.resolveStateOptions({}, {})
+		expect(defaults.cacheEnabled).toBe(true)
+		expect(defaults.cacheTtlMs).toBe(24 * 60 * 60 * 1000)
+		expect(internals.resolveStateOptions({ cacheEnabled: false }, {}).cacheEnabled).toBe(false)
+		expect(internals.resolveStateOptions({}, { RESEARCH_CACHE_ENABLED: "0" }).cacheEnabled).toBe(false)
+		expect(internals.resolveStateOptions({}, { RESEARCH_CACHE_TTL_MS: "1000" }).cacheTtlMs).toBe(1000)
+		expect(internals.resolveStateOptions({ cacheTtlMs: 500 }, { RESEARCH_CACHE_TTL_MS: "1000" }).cacheTtlMs).toBe(500)
+	})
+})
+
+describe("source ledger", () => {
+	const entry = (url: string, readAt: number) => ({ url, title: url, backend: "firecrawl" as const, readAt, excerpt: "" })
+
+	test("entries append and the same URL is updated, not duplicated", () => {
+		let ledger = internals.emptyLedger("s")
+		ledger = internals.appendSource(ledger, entry("https://a.test", 1), 10)
+		ledger = internals.appendSource(ledger, entry("https://b.test", 2), 10)
+		expect(ledger.entries.map((item) => item.url)).toEqual(["https://a.test", "https://b.test"])
+		ledger = internals.appendSource(ledger, entry("https://a.test", 3), 10)
+		expect(ledger.entries.map((item) => item.url)).toEqual(["https://b.test", "https://a.test"])
+	})
+
+	test("the cap drops the oldest entries and reports how many", () => {
+		let ledger = internals.emptyLedger("s")
+		ledger = internals.appendSource(ledger, entry("https://a.test", 1), 2)
+		ledger = internals.appendSource(ledger, entry("https://b.test", 2), 2)
+		ledger = internals.appendSource(ledger, entry("https://c.test", 3), 2)
+		expect(ledger.entries.map((item) => item.url)).toEqual(["https://b.test", "https://c.test"])
+		expect(ledger.dropped).toBe(1)
+	})
+
+	test("ledger keys are per session and malformed values are rejected", () => {
+		expect(internals.sourceStorageKey("ses_1")).toBe("research/sources/ses_1")
+		expect(internals.isSessionLedger({ sessionID: "s", entries: [], dropped: 0 })).toBe(true)
+		expect(internals.isSessionLedger({ sessionID: "s", entries: [] })).toBe(false)
+	})
+
+	test("an empty ledger says so, and a full one lists URLs with backend and time", () => {
+		expect(internals.formatSourceLedger(internals.emptyLedger("s"))).toContain("No sources read")
+		const ledger = internals.appendSource(internals.emptyLedger("s"), entry("https://a.test", 0), 5)
+		const text = internals.formatSourceLedger(ledger)
+		expect(text).toContain("https://a.test")
+		expect(text).toContain("firecrawl")
+		expect(text).toContain("1970-01-01 00:00 UTC")
+		expect(text).toContain("Source list:")
+	})
+})
+
+describe("session stats", () => {
+	test("the counters start at zero for every backend", () => {
+		const stats = internals.emptyStats("s")
+		for (const backend of ["tavily", "exa", "firecrawl", "jina"] as const) {
+			expect(stats.backends[backend]).toEqual({ calls: 0, failures: 0, fallbacks: 0, results: 0 })
+		}
+		expect(stats.pagesRead).toBe(0)
+		expect(internals.isResearchStats(stats)).toBe(true)
+		expect(internals.isResearchStats({ sessionID: "s" })).toBe(false)
+		expect(internals.statsStorageKey("lifetime")).toBe("research/stats/lifetime")
+	})
+
+	test("the view shows zeros, the page counts and the lifetime total", () => {
+		const stats = internals.emptyStats("s")
+		const lifetime = internals.emptyStats("lifetime")
+		lifetime.backends.tavily.calls = 10
+		lifetime.backends.tavily.failures = 2
+		const text = internals.formatStats(stats, lifetime)
+		expect(text).toContain("Research stats")
+		expect(text).toContain("pages read: 0")
+		expect(text).toContain("cache hits: 0")
+		expect(text).toContain("lifetime: 10 call(s), 2 failure(s)")
+		expect(text).toContain("no query text")
+		expect(text).not.toContain("TAVILY_API_KEY")
+	})
+})
+
+describe("routing injection decision", () => {
+	test("no brief and no setting means no routing block", () => {
+		expect(internals.routingMode({ hasBrief: false, routingAlways: false, injectRouting: true })).toBe("none")
+	})
+
+	test("an active brief gets the contract and the routing block", () => {
+		expect(internals.routingMode({ hasBrief: true, routingAlways: false, injectRouting: true })).toBe("contract+routing")
+	})
+
+	test("routingAlways restores the block in every session", () => {
+		expect(internals.routingMode({ hasBrief: false, routingAlways: true, injectRouting: true })).toBe("routing")
+	})
+
+	test("injectRouting false wins over everything", () => {
+		expect(internals.routingMode({ hasBrief: true, routingAlways: true, injectRouting: false })).toBe("none")
+	})
+
+	test("the routing block names the ledger and the merge mode", () => {
+		const all = { tavily: true, exa: true, firecrawl: true, jina: true }
+		const procedure = internals.buildRoutingText(all)
+		expect(procedure).toContain("research_sources")
+		expect(procedure).toContain('mode "merge"')
+		expect(procedure).toContain("RULES")
+		expect(internals.buildResearchContract("q")).toContain("research_sources")
 	})
 })
