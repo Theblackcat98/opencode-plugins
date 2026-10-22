@@ -47,6 +47,34 @@ summary as a synthetic, non-resuming message. The old session is never mutated.
 - Registers no keymap layer on purpose: an optional feature must never be able
   to fail `setup()`.
 
+### research — sourced web research (`plugins/research/`)
+
+One research surface over four backends: **Tavily** (agent-shaped web search,
+site mapping), **Exa** (neural/semantic search, find-similar-by-URL),
+**Firecrawl** (scrape, crawl, structured extraction) and **Jina AI** (URL to
+LLM-ready markdown, works without an API key). Full details in
+`plugins/research/README.md`.
+
+- Six tools under the `research` namespace: `search`, `find_similar`, `read`,
+  `crawl`, `map` and `extract`.
+- The point of the plugin is the routing block, a system instruction on every
+  model call that tells the model which backend fits which job, and in what
+  order to work. It is rebuilt from the backends that actually have
+  credentials, so a route without a key is never advertised.
+- `research_search` takes an `engine` parameter (`auto`, `neural`, `keyword`)
+  so the model can deliberately ask for semantic search on conceptual or
+  academic questions instead of always going to the keyword engine.
+- Each tool falls back through its backends in order and names the one that
+  answered. Jina is the last-resort reader, so `read` works with no
+  credentials at all.
+- `/research <question>` starts a sourced task: the question is durable, and a
+  stricter contract (cite every claim, prefer primary sources, never guess)
+  rides along as a system instruction and survives compaction.
+- Web tools refuse private, loopback and metadata addresses by default, so the
+  agent cannot be pointed at a cloud metadata service. The guard is hostname
+  based; it stops accidents, not a determined SSRF.
+- Server half only: nothing to render, nothing to share between processes.
+
 ### opencode-go-usage — Go quota in the sidebar (`plugins/opencode-go-usage/`)
 
 Shows OpenCode Go usage in the session sidebar: percent used for the rolling
@@ -77,6 +105,7 @@ Copy the plugin directory into your OpenCode config (the reference layout is
 ```sh
 cp -r plugins/goal ~/.config/opencode/plugins/goal
 cp -r plugins/handoff ~/.config/opencode/plugins/handoff
+cp -r plugins/research ~/.config/opencode/plugins/research
 cp -r plugins/opencode-go-usage ~/.config/opencode/plugins/opencode-go-usage
 ```
 
