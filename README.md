@@ -72,7 +72,9 @@ LLM-ready markdown, works without an API key). Full details in
   rides along as a system instruction and survives compaction.
 - Web tools refuse private, loopback and metadata addresses by default, so the
   agent cannot be pointed at a cloud metadata service. The guard is hostname
-  based; it stops accidents, not a determined SSRF.
+  based; it stops accidents, not a determined SSRF. The plugin never fetches
+  a URL itself, the provider does, so a local DNS check would not close that
+  gap.
 - Server half only: nothing to render, nothing to share between processes.
 
 ### notify — ntfy push when a generation ends (`plugins/notify/`)

@@ -157,6 +157,22 @@ The check is **hostname based**, so a public hostname that resolves to a private
 address still passes. It is a guard against accidents, not a complete SSRF
 defence.
 
+### Why a local DNS check would not help
+
+The plugin never fetches a URL itself. `research_read`, `research_crawl`,
+`research_map` and `research_extract` hand the URL to Firecrawl or Jina, and
+that service fetches it from its own network. Two things follow:
+
+- Resolving the hostname here would say nothing about the address the provider
+  reaches. It would only ever protect the machine running OpenCode, which is
+  not the machine that makes the request.
+- A redirect cannot be inspected either. The provider follows it, so a public
+  host that redirects to a link-local address is out of reach of this guard.
+
+What the guard does buy is the common accident: the agent cannot hand a
+private, loopback or metadata-looking host to a third party by name. That is
+what it blocks, and it is worth keeping for that reason alone.
+
 ## Layout
 
 ```
