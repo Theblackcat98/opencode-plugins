@@ -1,3 +1,6 @@
+import { rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import { internals } from "./index.js"
 
@@ -22,6 +25,39 @@ describe("config resolution", () => {
 		expect(cfg.server).toBe("https://ntfy.example.com")
 	})
 
+	test("environment variables win over the config file", () => {
+		const cfg = internals.resolveConfig(
+			{},
+			{ OPENCODE_NTFY_TOPIC: "from-env" },
+			{ topic: "from-file", server: "https://file.example.com" },
+		)
+		expect(cfg.topic).toBe("from-env")
+		expect(cfg.server).toBe("https://file.example.com")
+	})
+
+	test("the config file is used when nothing else holds a value", () => {
+		const cfg = internals.resolveConfig(
+			{},
+			{},
+			{
+				server: "https://file.example.com",
+				topic: "from-file",
+				token: "tk_file",
+				priority: "high",
+				minDurationSec: 120,
+				includeSubagents: true,
+				allLocations: true,
+			},
+		)
+		expect(cfg.server).toBe("https://file.example.com")
+		expect(cfg.topic).toBe("from-file")
+		expect(cfg.token).toBe("tk_file")
+		expect(cfg.priority).toBe("high")
+		expect(cfg.minDurationMs).toBe(120_000)
+		expect(cfg.includeSubagents).toBe(true)
+		expect(cfg.allLocations).toBe(true)
+	})
+
 	test("environment variables are the fallback", () => {
 		const cfg = internals.resolveConfig(
 			{},
@@ -31,6 +67,8 @@ describe("config resolution", () => {
 				OPENCODE_NTFY_TOKEN: "tk_env",
 				OPENCODE_NTFY_MIN_SECONDS: "300",
 				OPENCODE_NTFY_PRIORITY: "high",
+				OPENCODE_NTFY_INCLUDE_SUBAGENTS: "true",
+				OPENCODE_NTFY_ALL_LOCATIONS: "true",
 			},
 		)
 		expect(cfg.topic).toBe("env-topic")
@@ -38,6 +76,8 @@ describe("config resolution", () => {
 		expect(cfg.token).toBe("tk_env")
 		expect(cfg.minDurationMs).toBe(300_000)
 		expect(cfg.priority).toBe("high")
+		expect(cfg.includeSubagents).toBe(true)
+		expect(cfg.allLocations).toBe(true)
 	})
 
 	test("blank values are ignored", () => {
@@ -53,6 +93,58 @@ describe("config resolution", () => {
 	test("booleans accept strings", () => {
 		expect(internals.resolveConfig({ includeSubagents: "true" }, {}).includeSubagents).toBe(true)
 		expect(internals.resolveConfig({ allLocations: "false" }, {}).allLocations).toBe(false)
+	})
+})
+
+describe("config file", () => {
+	test("the path comes from the option, the environment or the default", () => {
+		expect(internals.resolveConfigFilePath({ configFile: "/tmp/one.json" }, {})).toBe("/tmp/one.json")
+		expect(internals.resolveConfigFilePath({}, { OPENCODE_NTFY_CONFIG: "/tmp/two.json" })).toBe("/tmp/two.json")
+		expect(internals.resolveConfigFilePath({}, { XDG_CONFIG_HOME: "/home/me/.config" })).toBe(
+			"/home/me/.config/opencode/notify.json",
+		)
+	})
+
+	test("a missing file holds no settings and is not an error", () => {
+		const result = internals.readConfigFile("/tmp/notify-does-not-exist.json")
+		expect(result.error).toBeUndefined()
+		expect(result.values).toEqual({})
+	})
+
+	test("a valid file holds the settings", () => {
+		const path = join(tmpdir(), `notify-config-${process.pid}.json`)
+		writeFileSync(path, JSON.stringify({ server: "https://file.example.com", topic: "from-file" }))
+		try {
+			const result = internals.readConfigFile(path)
+			expect(result.error).toBeUndefined()
+			expect(result.values.topic).toBe("from-file")
+		} finally {
+			rmSync(path, { force: true })
+		}
+	})
+
+	test("a broken file is reported and holds no settings", () => {
+		const path = join(tmpdir(), `notify-config-broken-${process.pid}.json`)
+		writeFileSync(path, "{ not json")
+		try {
+			const result = internals.readConfigFile(path)
+			expect(result.error).toContain("not valid JSON")
+			expect(result.values).toEqual({})
+		} finally {
+			rmSync(path, { force: true })
+		}
+	})
+
+	test("a file that is not an object is reported", () => {
+		const path = join(tmpdir(), `notify-config-array-${process.pid}.json`)
+		writeFileSync(path, "[1, 2, 3]")
+		try {
+			const result = internals.readConfigFile(path)
+			expect(result.error).toContain("JSON object")
+			expect(result.values).toEqual({})
+		} finally {
+			rmSync(path, { force: true })
+		}
 	})
 })
 

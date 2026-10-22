@@ -18,6 +18,9 @@
  *   fetch                             ntfy publish (plain text plus headers)
  */
 
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 
 const DEFAULT_SERVER = "https://ntfy.sh"
@@ -106,22 +109,23 @@ function describeError(error: unknown): string {
 }
 
 /**
- * Options win over environment variables, environment variables win over the
- * defaults. The topic is the only thing that really matters: it is the
- * ntfy channel the phone subscribes to.
+ * Settings come from three places, in this order: the plugin options in
+ * opencode.json, then the environment, then the config file, then the
+ * built-in defaults. The first source that holds a usable value wins.
  */
 export function resolveConfig(
 	options: Readonly<Record<string, any>>,
 	env: Readonly<Record<string, string | undefined>> = process.env,
+	file: Readonly<Record<string, any>> = {},
 ): NotifyConfig {
-	const server = asString(options.server) ?? asString(env.OPENCODE_NTFY_SERVER) ?? DEFAULT_SERVER
-	const topic = asString(options.topic) ?? asString(env.OPENCODE_NTFY_TOPIC) ?? DEFAULT_TOPIC
-	const token = asString(options.token) ?? asString(env.OPENCODE_NTFY_TOKEN) ?? asString(env.NTFY_TOKEN)
-	const priority = asString(options.priority) ?? asString(env.OPENCODE_NTFY_PRIORITY) ?? DEFAULT_PRIORITY
-	const minSeconds =
-		asNumberLike(options.minDurationSec) ?? asNumberLike(env.OPENCODE_NTFY_MIN_SECONDS) ?? 0
-	const includeSubagents = asBoolean(options.includeSubagents) ?? false
-	const allLocations = asBoolean(options.allLocations) ?? false
+	const sources = [options, envValues(env), file]
+	const server = pick(sources, "server", asString) ?? DEFAULT_SERVER
+	const topic = pick(sources, "topic", asString) ?? DEFAULT_TOPIC
+	const token = pick(sources, "token", asString)
+	const priority = pick(sources, "priority", asString) ?? DEFAULT_PRIORITY
+	const minSeconds = pick(sources, "minDurationSec", asNumberLike) ?? 0
+	const includeSubagents = pick(sources, "includeSubagents", asBoolean) ?? false
+	const allLocations = pick(sources, "allLocations", asBoolean) ?? false
 	return {
 		server,
 		topic,
@@ -131,6 +135,74 @@ export function resolveConfig(
 		includeSubagents,
 		allLocations,
 	}
+}
+
+/** The environment variables, mapped onto the option names. */
+function envValues(env: Readonly<Record<string, string | undefined>>): Record<string, string | undefined> {
+	return {
+		server: env.OPENCODE_NTFY_SERVER,
+		topic: env.OPENCODE_NTFY_TOPIC,
+		token: env.OPENCODE_NTFY_TOKEN ?? env.NTFY_TOKEN,
+		priority: env.OPENCODE_NTFY_PRIORITY,
+		minDurationSec: env.OPENCODE_NTFY_MIN_SECONDS,
+		includeSubagents: env.OPENCODE_NTFY_INCLUDE_SUBAGENTS,
+		allLocations: env.OPENCODE_NTFY_ALL_LOCATIONS,
+	}
+}
+
+/** The first source that holds a value the parser accepts. */
+function pick<T>(
+	sources: readonly Readonly<Record<string, any>>[],
+	key: string,
+	parse: (value: unknown) => T | undefined,
+): T | undefined {
+	for (const source of sources) {
+		const value = parse(source?.[key])
+		if (value !== undefined) return value
+	}
+	return undefined
+}
+
+/**
+ * Read the config file. A missing file is normal and returns no settings; a
+ * broken file is an error the caller reports and then ignores, so a typo in
+ * the config never stops the plugin from loading.
+ */
+export function readConfigFile(path: string): { values: Record<string, any>; error?: string } {
+	let raw: string
+	try {
+		raw = readFileSync(path, "utf8")
+	} catch (error) {
+		const code = (error as { code?: string })?.code
+		if (code === "ENOENT") return { values: {} }
+		return { values: {}, error: describeError(error) }
+	}
+	try {
+		const parsed = JSON.parse(raw)
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return { values: {}, error: "config file must hold a JSON object" }
+		}
+		return { values: parsed as Record<string, any> }
+	} catch (error) {
+		return { values: {}, error: `config file is not valid JSON: ${describeError(error)}` }
+	}
+}
+
+/** The default config file, next to the OpenCode configuration. */
+export function defaultConfigPath(env: Readonly<Record<string, string | undefined>> = process.env): string {
+	const base = asString(env.XDG_CONFIG_HOME) ?? join(homedir(), ".config")
+	return join(base, "opencode", "notify.json")
+}
+
+/**
+ * Where the config file lives. The option wins over the environment, and the
+ * environment over the default next to the OpenCode configuration.
+ */
+export function resolveConfigFilePath(
+	options: Readonly<Record<string, any>>,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+	return asString(options.configFile) ?? asString(env.OPENCODE_NTFY_CONFIG) ?? defaultConfigPath(env)
 }
 
 /**
@@ -280,7 +352,10 @@ export function shouldNotify(durationMs: number | undefined, minDurationMs: numb
 
 export const internals = {
 	resolveConfig,
+	resolveConfigFilePath,
 	resolveEndpoint,
+	readConfigFile,
+	defaultConfigPath,
 	encodeHeaderValue,
 	buildHeaders,
 	resolveTitle,
@@ -301,28 +376,62 @@ export const internals = {
 	TOPIC_PATTERN,
 }
 
+/**
+ * One plugin instance exists per location, but a plugin can also be listed
+ * in opencode.json and discovered in the plugins directory at the same time.
+ * The last instance to start owns the location, so a doubly loaded plugin
+ * reports a run once, not twice.
+ */
+const locationOwners = new Map<string, symbol>()
+
 export default Plugin.define({
 	id: "notify",
 	async setup(ctx) {
 		const options = (ctx.options ?? {}) as Readonly<Record<string, any>>
-		const config = resolveConfig(options)
 
 		const log = {
 			info: (message: string) => console.log(`[notify] ${message}`),
 			warn: (message: string) => console.error(`[notify] ${message}`),
 		}
 
-		let endpoint: string
-		try {
-			endpoint = resolveEndpoint(config)
-		} catch (error) {
-			// A bad configuration must not take the server down with it.
-			log.warn(`disabled: ${describeError(error)}`)
-			return
+		// The config file holds the settings of a user who installed the
+		// plugin as a directory, where opencode.json has no entry for it.
+		const configPath = resolveConfigFilePath(options)
+
+		/**
+		 * Read the settings. It runs again for every report, so a change to
+		 * the config file takes effect on the next run without a restart.
+		 */
+		const loadConfig = (): { config: NotifyConfig; endpoint: string } | { error: string } => {
+			const file = readConfigFile(configPath)
+			if (file.error) log.warn(`${configPath}: ${file.error}`)
+			const config = resolveConfig(options, process.env, file.values)
+			try {
+				return { config, endpoint: resolveEndpoint(config) }
+			} catch (error) {
+				// A bad configuration must not take the server down with it.
+				return { error: describeError(error) }
+			}
+		}
+
+		const initial = loadConfig()
+		if ("error" in initial) {
+			log.warn(`notifications stay off until the configuration is valid: ${initial.error}`)
+		} else {
+			log.info(
+				`ready (endpoint: ${initial.endpoint}, priority: ${initial.config.priority}, minimum run: ${initial.config.minDurationMs}ms, config: ${configPath})`,
+			)
 		}
 
 		const locationRoots = [ctx.location.directory, ctx.location.project?.directory, ctx.location.project?.canonical]
 		const instanceProjectID = asString(ctx.location.project?.id)
+
+		// Take ownership of this location. Another instance for the same
+		// location stays subscribed but stops reporting.
+		const ownerKey = instanceProjectID ?? ctx.location.directory
+		const ownerToken = Symbol("notify instance")
+		locationOwners.set(ownerKey, ownerToken)
+		const ownsLocation = () => locationOwners.get(ownerKey) === ownerToken
 
 		// Transient state: the start time of a running generation and the
 		// moment a session was last reported. Both reset on restart.
@@ -341,7 +450,7 @@ export default Plugin.define({
 			}
 		}
 
-		const publish = async (payload: NotifyPayload): Promise<void> => {
+		const publish = async (endpoint: string, config: NotifyConfig, payload: NotifyPayload): Promise<void> => {
 			const controller = new AbortController()
 			const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
 			try {
@@ -361,9 +470,20 @@ export default Plugin.define({
 		}
 
 		const report = async (event: SessionEvent, outcome: Outcome): Promise<void> => {
+			// Another instance owns this location now.
+			if (!ownsLocation()) return
 			const data = event.data ?? {}
 			const sessionID = asString(data.sessionID)
 			if (!sessionID) return
+
+			// The settings are read again, so a change to the config file
+			// applies to the next run.
+			const loaded = loadConfig()
+			if ("error" in loaded) {
+				log.warn(`not reported: ${loaded.error}`)
+				return
+			}
+			const { config, endpoint } = loaded
 
 			const now = Date.now()
 			prune(now)
@@ -415,7 +535,7 @@ export default Plugin.define({
 			})
 
 			try {
-				await publish(payload)
+				await publish(endpoint, config, payload)
 				log.info(`reported ${sessionID} (${outcome})`)
 			} catch (error) {
 				// A failed notification must never break the session.
@@ -455,12 +575,11 @@ export default Plugin.define({
 			}
 		})().catch((error) => log.warn(`event loop stopped: ${describeError(error)}`))
 
-		log.info(`ready (topic: ${config.topic}, minimum run: ${config.minDurationMs}ms)`)
-
 		return async () => {
 			controller.abort()
 			startedAt.clear()
 			reportedAt.clear()
+			if (locationOwners.get(ownerKey) === ownerToken) locationOwners.delete(ownerKey)
 		}
 	},
 })

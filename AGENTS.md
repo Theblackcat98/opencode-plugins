@@ -24,6 +24,10 @@ Instructions for agents working in this repo.
 
 - Pure, testable helpers go at module scope and are exposed through the
   `internals` export; cover them with `bun:test`.
+- Plugin settings resolve in one order: `ctx.options`, then environment
+  variables, then an optional JSON config file at
+  `~/.config/opencode/<name>.json` (`notify` does this; keep new plugins
+  consistent).
 - Runtime state (maps, timers, registrations) lives in `setup()` closures.
 - Durable state goes in `ctx.storage` under a `"<name>/"` prefix with a
   type guard for rehydration; transient execution state (`busy`,

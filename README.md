@@ -79,7 +79,7 @@ LLM-ready markdown, works without an API key). Full details in
 
 A hook on the server event stream: when a model's generation ends, one ntfy
 message is published with the title of the chat, so a long run can be checked
-from a phone.
+from a phone. Full details in `plugins/notify/README.md`.
 
 - The notification title is the chat title. The body says how the run ended
   (`finished`, `failed`, `stopped`), how long it took, and where it ran.
@@ -91,12 +91,14 @@ from a phone.
 - Subagent sessions are skipped by default. A session is reported by the plugin
   instance that owns its project, so one run is one message even when several
   projects are open. `allLocations` (option) turns that filter off.
-- `minDurationSec` (option) or `OPENCODE_NTFY_MIN_SECONDS` (env) reports only
-  runs that lasted at least that long. The default reports every run.
-- `server`, `topic`, `token` and `priority` (option) or `OPENCODE_NTFY_SERVER`,
-  `OPENCODE_NTFY_TOPIC`, `OPENCODE_NTFY_TOKEN` and `OPENCODE_NTFY_PRIORITY`
-  (env) point it at another ntfy instance or a private topic. The default is
-  `https://ntfy.sh` and the topic `theblackcat`.
+- Settings come from the plugin options in `opencode.json`, then the
+  environment, then the config file `~/.config/opencode/notify.json`, then the
+  defaults. The config file is the way to configure a plugin that was
+  installed as a directory, and it is read again for every run, so a change
+  applies without a restart.
+- `server`, `topic`, `token` and `priority` point it at another ntfy instance
+  or a private topic. The default is `https://ntfy.sh` and the topic
+  `theblackcat`.
 - The title is RFC 2047 encoded when it is not plain ASCII, because an HTTP
   header cannot carry arbitrary UTF-8.
 - The topic is public, so the message carries only the chat title, the
