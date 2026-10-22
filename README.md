@@ -75,6 +75,34 @@ LLM-ready markdown, works without an API key). Full details in
   based; it stops accidents, not a determined SSRF.
 - Server half only: nothing to render, nothing to share between processes.
 
+### notify — ntfy push when a generation ends (`plugins/notify/`)
+
+A hook on the server event stream: when a model's generation ends, one ntfy
+message is published with the title of the chat, so a long run can be checked
+from a phone.
+
+- The notification title is the chat title. The body says how the run ended
+  (`finished`, `failed`, `stopped`), how long it took, and where it ran.
+- The trigger is the server's `session.execution.*` events, the same ones the
+  built-in terminal notification uses. The run length is measured from
+  `session.execution.started` to the terminal event.
+- A user interrupt (escape) is not reported; a failure, a timeout or an
+  inactivity stop is.
+- Subagent sessions are skipped by default. A session is reported by the plugin
+  instance that owns its project, so one run is one message even when several
+  projects are open. `allLocations` (option) turns that filter off.
+- `minDurationSec` (option) or `OPENCODE_NTFY_MIN_SECONDS` (env) reports only
+  runs that lasted at least that long. The default reports every run.
+- `server`, `topic`, `token` and `priority` (option) or `OPENCODE_NTFY_SERVER`,
+  `OPENCODE_NTFY_TOPIC`, `OPENCODE_NTFY_TOKEN` and `OPENCODE_NTFY_PRIORITY`
+  (env) point it at another ntfy instance or a private topic. The default is
+  `https://ntfy.sh` and the topic `theblackcat`.
+- The title is RFC 2047 encoded when it is not plain ASCII, because an HTTP
+  header cannot carry arbitrary UTF-8.
+- The topic is public, so the message carries only the chat title, the
+  outcome, the run length and the directory. Nothing else is sent.
+- Server half only: nothing to render, nothing to share between processes.
+
 ### opencode-go-usage — Go quota in the sidebar (`plugins/opencode-go-usage/`)
 
 Shows OpenCode Go usage in the session sidebar: percent used for the rolling
@@ -106,6 +134,7 @@ Copy the plugin directory into your OpenCode config (the reference layout is
 cp -r plugins/goal ~/.config/opencode/plugins/goal
 cp -r plugins/handoff ~/.config/opencode/plugins/handoff
 cp -r plugins/research ~/.config/opencode/plugins/research
+cp -r plugins/notify ~/.config/opencode/plugins/notify
 cp -r plugins/opencode-go-usage ~/.config/opencode/plugins/opencode-go-usage
 ```
 
