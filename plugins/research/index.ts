@@ -169,6 +169,22 @@ function asObjectArray(value: unknown): Record<string, unknown>[] | undefined {
 }
 
 /**
+ * Per-engine queries for a merged search. Each lane should carry its own
+ * sub-question or evidence job, not a copy of the same query. Unknown keys and
+ * blank values are ignored.
+ */
+export function asLaneQueries(value: unknown): Partial<Record<Backend, string>> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+	const record = value as Record<string, unknown>
+	const lanes: Partial<Record<Backend, string>> = {}
+	for (const backend of ["tavily", "exa", "jina"] as const) {
+		const text = asString(record[backend])
+		if (text) lanes[backend] = text
+	}
+	return lanes
+}
+
+/**
  * Translate the relative time window the model asked for into a day count,
  * so the Exa fallback applies the same restriction as Tavily.
  */
@@ -279,6 +295,7 @@ export const internals = {
 	formatStats,
 	formatCacheNote,
 	exaWindowDays,
+	asLaneQueries,
 	truncate,
 	// state helpers, re-exported so tests cover one import surface
 	appendSource,
@@ -612,7 +629,23 @@ export default Plugin.define({
 							type: "string",
 							enum: ["auto", "merge"],
 							description:
-								"auto = first engine that answers wins. merge = query several engines and return the deduplicated union, labelled by engine. Default auto.",
+								"auto = first engine that answers wins. merge = query several engines and return the deduplicated union, labelled by engine. Give each lane its own query in `queries`; repeating one query wastes a call. Default auto.",
+						},
+						queries: {
+							type: "object",
+							description:
+								"For mode merge: a query per engine, each with a distinct sub-question or evidence job. Keys are tavily, exa and jina; an omitted or blank lane uses `query`.",
+							properties: {
+								tavily: { type: "string" },
+								exa: { type: "string" },
+								jina: { type: "string" },
+							},
+							additionalProperties: false,
+						},
+						objective: {
+							type: "string",
+							description:
+								"Exa only: what should rank first, sources to exclude, and the facts to extract. Improves the ranking and the per-result summary.",
 						},
 						maxEngines: {
 							type: "integer",
@@ -685,13 +718,13 @@ export default Plugin.define({
 						topic,
 					}
 
-					const tavilyStep = (): Step<SearchOutcome> => ({
+					const tavilyStep = (laneQuery: string): Step<SearchOutcome> => ({
 						backend: "tavily",
 						run: () =>
 							tavilySearch(
 								cfg,
 								{
-									query,
+									query: laneQuery,
 									maxResults,
 									depth: args.depth === "advanced" ? "advanced" : "basic",
 									topic,
@@ -705,15 +738,16 @@ export default Plugin.define({
 								toolCtx.signal,
 							),
 					})
-					const exaStep = (): Step<SearchOutcome> => ({
+					const exaStep = (laneQuery: string): Step<SearchOutcome> => ({
 						backend: "exa",
 						run: () =>
 							exaSearch(
 								cfg,
 								{
-									query,
+									query: laneQuery,
 									maxResults,
 									type: exaType,
+									objective: asString(args.objective),
 									includeDomains,
 									excludeDomains,
 									startPublishedDate: windowDays ? publishedDateSince(windowDays) : undefined,
@@ -722,34 +756,38 @@ export default Plugin.define({
 								toolCtx.signal,
 							),
 					})
-					const jinaStep = (): Step<SearchOutcome> => ({
+					const jinaStep = (laneQuery: string): Step<SearchOutcome> => ({
 						backend: "jina",
 						run: () =>
 							jinaSearch(
 								cfg,
-								{ query, limit: maxResults, includeDomains, excludeDomains },
+								{ query: laneQuery, limit: maxResults, includeDomains, excludeDomains },
 								toolCtx.signal,
 							),
 					})
 
-					const ordered = (): Step<SearchOutcome>[] => {
+					const laneQueries = asLaneQueries(args.queries)
+					const queryFor = (backend: Backend): string => laneQueries[backend] ?? query
+
+					const ordered = (forBackend: (backend: Backend) => string = () => query): Step<SearchOutcome>[] => {
 						const steps: Step<SearchOutcome>[] = []
 						if (engine === "neural") {
-							if (available.exa) steps.push(exaStep())
-							if (available.tavily) steps.push(tavilyStep())
+							if (available.exa) steps.push(exaStep(forBackend("exa")))
+							if (available.tavily) steps.push(tavilyStep(forBackend("tavily")))
 						} else {
-							if (available.tavily) steps.push(tavilyStep())
-							if (available.exa) steps.push(exaStep())
+							if (available.tavily) steps.push(tavilyStep(forBackend("tavily")))
+							if (available.exa) steps.push(exaStep(forBackend("exa")))
 						}
-						steps.push(jinaStep())
+						steps.push(jinaStep(forBackend("jina")))
 						return steps
 					}
 
 					// -- merged search: union of several engines, not one engine's view.
 					if (merge) {
-						const candidates = ordered()
+						const candidates = ordered(queryFor)
 						const maxEngines = clamp(asNumber(args.maxEngines) ?? 2, 1, candidates.length)
 						const chosen = candidates.slice(0, maxEngines)
+						const lanes = chosen.map((step) => ({ backend: step.backend, query: queryFor(step.backend) }))
 						const settled = await Promise.allSettled(chosen.map((step) => step.run()))
 						const lists: { backend: Backend; results: SearchOutcome["results"] }[] = []
 						const failed: { backend: Backend; error: string }[] = []
@@ -776,7 +814,7 @@ export default Plugin.define({
 						]
 						return {
 							content:
-								formatMergedSearchResults(merged, query, maxResults) +
+								formatMergedSearchResults(merged, query, maxResults, lanes) +
 								(unsupported.length ? `\n${unsupported.map((note) => `note: ${note}`).join("\n")}` : ""),
 						}
 					}

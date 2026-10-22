@@ -67,6 +67,7 @@ export const INTERNALS = {
 	resolveConfig,
 	normalizeTavilySearch,
 	normalizeExaSearch,
+	buildExaSearchBody,
 	normalizeJinaSearch,
 	normalizeFirecrawlPage,
 	normalizeFirecrawlCrawl,
@@ -832,6 +833,8 @@ export interface ExaSearchParams {
 	startPublishedDate?: string
 	endPublishedDate?: string
 	includeRawContent?: boolean
+	/** What should rank first, exclusions, and the facts to extract. */
+	objective?: string
 }
 
 /**
@@ -867,24 +870,37 @@ export function publishedDateSince(days: number, now = new Date()): string {
 	return date.toISOString()
 }
 
+/**
+ * Exa takes an optional objective for its summary step: what should rank
+ * first, what to exclude, and which facts to pull out. A plain boolean summary
+ * loses that signal.
+ */
+export function buildExaSearchBody(params: ExaSearchParams): Record<string, unknown> {
+	const contents: Record<string, unknown> = params.includeRawContent
+		? { text: true, highlights: true }
+		: { highlights: true }
+	if (params.objective) contents.summary = { query: params.objective }
+	else if (!params.includeRawContent) contents.summary = true
+	const body: Record<string, unknown> = {
+		query: params.query,
+		numResults: clamp(params.maxResults ?? 8, 1, 100),
+		type: params.type ?? "auto",
+		contents,
+	}
+	if (params.includeDomains?.length) body.includeDomains = params.includeDomains
+	if (params.excludeDomains?.length) body.excludeDomains = params.excludeDomains
+	if (params.startPublishedDate) body.startPublishedDate = params.startPublishedDate
+	if (params.endPublishedDate) body.endPublishedDate = params.endPublishedDate
+	return body
+}
+
 export async function exaSearch(
 	cfg: ResearchConfig,
 	params: ExaSearchParams,
 	signal?: AbortSignal,
 ): Promise<SearchOutcome> {
 	if (!cfg.exaKey) throw new ProviderError("exa", "Exa API key is not configured")
-	const body: Record<string, unknown> = {
-		query: params.query,
-		numResults: clamp(params.maxResults ?? 8, 1, 100),
-		type: params.type ?? "auto",
-		contents: params.includeRawContent
-			? { text: true, highlights: true }
-			: { highlights: true, summary: true },
-	}
-	if (params.includeDomains?.length) body.includeDomains = params.includeDomains
-	if (params.excludeDomains?.length) body.excludeDomains = params.excludeDomains
-	if (params.startPublishedDate) body.startPublishedDate = params.startPublishedDate
-	if (params.endPublishedDate) body.endPublishedDate = params.endPublishedDate
+	const body = buildExaSearchBody(params)
 	const json = await fetchJson(
 		"exa",
 		`${EXA_BASE}/search`,

@@ -66,7 +66,8 @@ LLM-ready markdown, works without an API key). Full details in
   so the model can deliberately ask for semantic search on conceptual or
   academic questions instead of always going to the keyword engine.
   `mode: "merge"` queries two engines and returns the deduplicated union,
-  labelled with every engine that found each result.
+  labelled with every engine that found each result. Give each lane its own
+  query in `queries`; Exa also takes an `objective` for its ranking and summary.
 - Each tool falls back through its backends in order and names the one that
   answered. Jina is the last-resort reader, so `read` works with no
   credentials at all. Jina's own lack of domain/time filters is handled

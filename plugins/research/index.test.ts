@@ -272,6 +272,34 @@ describe("response normalization", () => {
 		expect(parsed.content).toBe("# Body")
 	})
 
+	test("an Exa objective becomes the summary query", () => {
+		const body = PROVIDER_INTERNALS.buildExaSearchBody({
+			query: "setup docs",
+			objective: "rank the vendor's official docs first; exclude unrelated products",
+			maxResults: 5,
+		})
+		expect(body.contents).toEqual({
+			highlights: true,
+			summary: { query: "rank the vendor's official docs first; exclude unrelated products" },
+		})
+		expect(body.numResults).toBe(5)
+		expect(body.type).toBe("auto")
+	})
+
+	test("without an objective Exa keeps a plain summary and raw content stays text-only", () => {
+		const plain = PROVIDER_INTERNALS.buildExaSearchBody({ query: "q" })
+		expect(plain.contents).toEqual({ highlights: true, summary: true })
+		const raw = PROVIDER_INTERNALS.buildExaSearchBody({ query: "q", includeRawContent: true })
+		expect(raw.contents).toEqual({ text: true, highlights: true })
+		const filters = PROVIDER_INTERNALS.buildExaSearchBody({
+			query: "q",
+			includeDomains: ["example.com"],
+			startPublishedDate: "2026-01-01T00:00:00.000Z",
+		})
+		expect(filters.includeDomains).toEqual(["example.com"])
+		expect(filters.startPublishedDate).toBe("2026-01-01T00:00:00.000Z")
+	})
+
 	test("exa results prefer the first highlight as the snippet", () => {
 		const outcome = PROVIDER_INTERNALS.normalizeExaSearch({
 			results: [
@@ -574,6 +602,43 @@ describe("merged search", () => {
 		expect(merged.disagreements.map((entry) => entry.url)).toEqual(["https://t0.test"])
 	})
 
+	test("per-lane queries are read for the three search engines only", () => {
+		expect(internals.asLaneQueries({ tavily: "broad", exa: "primary docs", jina: "  " })).toEqual({
+			tavily: "broad",
+			exa: "primary docs",
+		})
+		expect(internals.asLaneQueries({ firecrawl: "nope", tavily: "" })).toEqual({})
+		expect(internals.asLaneQueries("nope")).toEqual({})
+		expect(internals.asLaneQueries({ tavily: 42 })).toEqual({})
+	})
+
+	test("distinct lane queries are shown, a repeated query is not", () => {
+		const outcome = {
+			results: [
+				{
+					title: "A",
+					url: "https://a.test",
+					snippet: "",
+					engines: ["tavily", "exa"] as const,
+					positions: { tavily: 1, exa: 1 },
+				},
+			],
+			answered: ["tavily", "exa"] as const,
+			failed: [],
+			disagreements: [],
+		}
+		const distinct = internals.formatMergedSearchResults(outcome, "q", 8, [
+			{ backend: "tavily", query: "broad" },
+			{ backend: "exa", query: "primary docs" },
+		])
+		expect(distinct).toContain('Lanes: tavily="broad"; exa="primary docs"')
+		const same = internals.formatMergedSearchResults(outcome, "q", 8, [
+			{ backend: "tavily", query: "same" },
+			{ backend: "exa", query: "same" },
+		])
+		expect(same).not.toContain("Lanes:")
+	})
+
 	test("the merged format names the engines, the labels and the failures", () => {
 		const text = internals.formatMergedSearchResults(
 			{
@@ -726,5 +791,15 @@ describe("routing injection decision", () => {
 		expect(procedure).toContain('mode "merge"')
 		expect(procedure).toContain("RULES")
 		expect(internals.buildResearchContract("q")).toContain("research_sources")
+	})
+
+	test("the contract carries the research discipline, not just the citation rule", () => {
+		const contract = internals.buildResearchContract("is X true")
+		expect(contract).toContain("subclaims")
+		expect(contract).toContain("independent searches in parallel")
+		expect(contract).toContain("snippets are leads")
+		expect(contract).toContain("untrusted data")
+		expect(contract).toContain("counterclaim")
+		expect(contract).toContain("Stop when the key claims are adequately supported")
 	})
 })
