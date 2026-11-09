@@ -168,3 +168,31 @@ describe("goal argument parsing", () => {
 		).toBe(false)
 	})
 })
+
+describe("goal tool visibility", () => {
+	const activeGoal = {
+		sessionID: "root",
+		objective: "make tests pass",
+		maxRounds: 8,
+		round: 0,
+		status: "active" as const,
+		createdAt: 1,
+	}
+
+	test("exposes tools only in the root session that owns an active goal", () => {
+		const goals = new Map([["root", activeGoal]])
+		expect(internals.activeRootGoal("root", goals, new Map())).toBe(activeGoal)
+		expect(internals.activeRootGoal("child", goals, new Map([["child", "root"]]))).toBeUndefined()
+	})
+
+	test("hides tools once the goal is no longer active", () => {
+		for (const status of ["done", "gave_up", "aborted", "stopped"] as const) {
+			const goals = new Map([["root", { ...activeGoal, status }]])
+			expect(internals.activeRootGoal("root", goals, new Map())).toBeUndefined()
+		}
+	})
+
+	test("hides tools when no goal exists", () => {
+		expect(internals.activeRootGoal("root", new Map(), new Map())).toBeUndefined()
+	})
+})

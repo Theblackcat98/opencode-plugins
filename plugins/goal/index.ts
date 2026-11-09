@@ -150,7 +150,7 @@ const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // a restart, running children are gone and links rebuild from new events.
 const childSessions = new Map<string, string>()
 
-export const internals = { parseGoalArguments, parseVerdict, extractJSONObject, isUnreadableVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, goalEventData, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
+export const internals = { parseGoalArguments, parseVerdict, extractJSONObject, isUnreadableVerdict, truncate, matchesRule, isGoalState, goalStorageKey, goalSystemText, goalStartText, isWatchdogText, buildGoalSessionRules, resolveRoot, activeRootGoal, goalEventData, GOAL_STORAGE_PREFIX, GOAL_DENY_SHELL, GOAL_ALLOW_EXTERNAL }
 
 function truncate(text: string, limit: number): string {
 	if (text.length <= limit) return text
@@ -277,6 +277,22 @@ function isTextPart(part: unknown): part is { type: "text"; text: string } {
 
 function isGoalActive(goal: GoalState | undefined): goal is GoalState {
 	return !!goal && goal.status === "active"
+}
+
+/**
+ * Goal tools are registered location-wide, but they are only meaningful in the
+ * root session that owns an active goal. Resolve the session through its parent
+ * chain; child sessions never own goal tools, even while the root goal is live.
+ */
+function activeRootGoal(
+	sessionID: string,
+	goals: ReadonlyMap<string, GoalState>,
+	parentOf: ReadonlyMap<string, string>,
+): GoalState | undefined {
+	const root = resolveRoot(sessionID, parentOf)
+	if (root !== sessionID) return undefined
+	const goal = goals.get(root)
+	return isGoalActive(goal) ? goal : undefined
 }
 
 /** V2 session transcripts are a wide union; pull readable text defensively. */
@@ -753,13 +769,16 @@ export default Plugin.define({
 		})
 
 		// ---- goal_complete / goal_block tools ---------------------------------
+		// Registration is location-wide; visibility is per session. The context
+		// hook below deletes both tools from requests that are not the root of
+		// an active goal, so a normal chat never sees mode-only tools.
 		// options.permission names the V2 permission action, which keeps the
 		// { action: "goal_complete", effect: "deny" } agent rules in opencode.json working.
 		await ctx.tool.transform((editor) => {
 			editor.add({
 				name: "goal_complete",
 				description:
-					"Declare that the active goal is complete. A verifier (check command and/or LLM judge) arbitrates the claim. Provide concrete evidence: commands run, their output, files changed.",
+					"Only available while /goal is active in the root goal session. Declare that the active goal is complete. A verifier (check command and/or LLM judge) arbitrates the claim. Provide concrete evidence: commands run, their output, files changed.",
 				input: {
 					type: "object",
 					properties: {
@@ -778,7 +797,9 @@ export default Plugin.define({
 						return { content: "Goal tools are only available in the root goal session, not in subagents. Report your result normally and let the root session decide." }
 					}
 					const goal = goals.get(root)
-					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
+					if (!goal || goal.status !== "active") {
+						return { content: "No active goal in this session, so nothing was changed. goal_complete is only available while /goal is active." }
+					}
 					if (verifying.has(root)) {
 						return { content: "Verifier busy. Wait briefly, then call goal_complete again." }
 					}
@@ -796,7 +817,7 @@ export default Plugin.define({
 			editor.add({
 				name: "goal_block",
 				description:
-					"Report that the active goal cannot be reached (missing access, unsatisfiable requirement, repeated dead ends). Ends goal mode. Explain what was tried.",
+					"Only available while /goal is active in the root goal session. Report that the active goal cannot be reached (missing access, unsatisfiable requirement, repeated dead ends). Ends goal mode. Explain what was tried.",
 				input: {
 					type: "object",
 					properties: {
@@ -813,7 +834,9 @@ export default Plugin.define({
 						return { content: "Goal tools are only available in the root goal session, not in subagents. Report your result normally and let the root session decide." }
 					}
 					const goal = goals.get(root)
-					if (!goal || goal.status !== "active") return { content: "No active goal in this session." }
+					if (!goal || goal.status !== "active") {
+						return { content: "No active goal in this session, so nothing was changed. goal_block is only available while /goal is active." }
+					}
 					goal.status = "gave_up"
 					await persistGoal(goal)
 					await emitGoalEvent(goal)
@@ -832,6 +855,14 @@ export default Plugin.define({
 		await ctx.permission.hook("evaluate", (evaluation) => {
 			const root = resolveRoot(evaluation.sessionID, childSessions)
 			const goal = goals.get(root)
+			// Defence in depth: the context hook hides these tools when no goal
+			// is active, but a stale tool snapshot must fail loudly rather than
+			// execute as a no-op.
+			if ((evaluation.action === "goal_complete" || evaluation.action === "goal_block") && !isGoalActive(goal)) {
+				log.info(`denied ${evaluation.action}: no active goal`)
+				evaluation.effect = "deny"
+				return
+			}
 			if (!isGoalActive(goal)) return
 			// Subagents do goal work under the same policy, but only the root
 			// session may settle the goal.
@@ -880,8 +911,16 @@ export default Plugin.define({
 		// instruction. Nothing user-visible is injected.
 		hookRegistrations.push(
 			await ctx.session.hook("context", (event) => {
-				const goal = goals.get(event.sessionID)
-				if (!isGoalActive(goal)) return
+				const goal = activeRootGoal(event.sessionID, goals, childSessions)
+				if (!goal) {
+					// Tool registration is location-wide; visibility is per
+					// session. Hide the goal tools from the model unless this
+					// root session owns an active goal, otherwise they appear
+					// as tools that can only answer "no active goal".
+					delete event.tools.goal_complete
+					delete event.tools.goal_block
+					return
+				}
 				event.system.push({ type: "text", text: goalSystemText(goal) })
 			}),
 		)
@@ -891,6 +930,9 @@ export default Plugin.define({
 		// prefix an already-computed summary so the state survives.
 		hookRegistrations.push(
 			await ctx.session.hook("compaction", (event) => {
+				// A compaction request summarizes; goal tools never belong in it.
+				delete event.tools.goal_complete
+				delete event.tools.goal_block
 				const goal = goals.get(event.sessionID)
 				if (!isGoalActive(goal)) return
 				event.system.push({

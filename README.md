@@ -16,7 +16,9 @@ Drives the agent autonomously until a verifiable objective is reached.
 - A watchdog verifies claims: a deterministic check command when `--check`
   is given, otherwise an LLM judge over the transcript.
 - `goal_complete` / `goal_block` tools let the agent declare completion or
-  report being blocked; the verifier arbitrates.
+  report being blocked; the verifier arbitrates. They are registered once but
+  filtered per model request, so they appear only in the root session that owns
+  an active goal — not in forked sessions, finished goals, or subagents.
 - Goal state survives restarts via `ctx.storage`; the contract ships as a
   system instruction on every model call so transcripts stay clean.
 - Session-scoped permission rules deny dangerous shells and confine external
