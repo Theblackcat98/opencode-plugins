@@ -144,6 +144,25 @@ is coloured green/amber/red by usage band.
 - Pure helpers (`parseZenUsage`, `parseConsoleStatus`, `selectCredential`,
   `filledSegments`, `severity`, `detailText`) are exported for `bun test`.
 
+### workflow — multi-subagent workflow engine (`plugins/workflow/`)
+
+One script orchestrates several subagent sessions, drawn as a phase graph, with
+artifacts the user keeps. Modelled on ZCode's dynamic workflows.
+
+- `/workflow <task>` loads the `workflow` skill and drives the plan → confirm →
+  run → report loop.
+- Tools: `workflow_plan`, `workflow_create` (confirm-gated), `workflow_get`,
+  `workflow_list`, `workflow_wait`, `workflow_stop`, `workflow_amend`,
+  `workflow_save`, `workflow_list_saved`.
+- Scripts are JavaScript function bodies (TypeScript accepted via Bun's
+  transpiler) against a facade: `agent().ask` / `askJSON`, `phase`, `world.run`,
+  `files`, `git`, `report`, `artifact.*`, `channel`, `future`.
+- Every run journals its asks; `workflow_amend` replays unchanged asks from
+  cache, so a revision pays only for what changed.
+- The TUI half shows a session panel with the phase graph, live agents, artifact
+  cards and the log, plus a prompt status dot, palette commands and toasts.
+- Full details and limits: `plugins/workflow/README.md`.
+
 ## Install a plugin for local use
 
 Copy the plugin directory into your OpenCode config (the reference layout is
@@ -155,6 +174,7 @@ cp -r plugins/handoff ~/.config/opencode/plugins/handoff
 cp -r plugins/research ~/.config/opencode/plugins/research
 cp -r plugins/notify ~/.config/opencode/plugins/notify
 cp -r plugins/opencode-go-usage ~/.config/opencode/plugins/opencode-go-usage
+cp -r plugins/workflow ~/.config/opencode/plugins/workflow
 ```
 
 Restart the OpenCode service (`opencode service restart`) so the server half
