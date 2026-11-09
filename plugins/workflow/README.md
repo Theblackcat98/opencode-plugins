@@ -4,7 +4,8 @@ One script orchestrates several subagent sessions. The run is drawn as a phase
 graph, reports as it goes, and publishes artifact cards the user keeps.
 
 Modelled on ZCode's `dynamic-workflows` skill, rebuilt against OpenCode V2's
-plugin API (server + TUI + RPC).
+plugin API (server + TUI + RPC). The run is drawn as a layered canvas in the
+fullscreen panel and as a compact spine in the side panel.
 
 Full reference — concepts, facade, tools, RPC, TUI, caps, security, recovery:
 [`docs/workflow-plugin.md`](../../docs/workflow-plugin.md).
@@ -32,6 +33,27 @@ Then, from the agent:
 Saved definitions: `workflow_save` / `workflow_list_saved`. Project files live
 in `.opencode/workflows/<name>.wf.js`, global ones in
 `~/.config/opencode/workflows/<name>.wf.js`.
+
+## Visuals
+
+- **Fullscreen panel** (`f`; the host forces fullscreen on narrow panes):
+  layered left-to-right graph. Nodes are rounded
+  boxes coloured by status; edges are routed as orthogonal lines with `▶`
+  arrowheads; loop edges run below the graph and enter from the bottom with
+  `▲`. The inspector below shows the selected node's agents, artifacts and log.
+- **Side panel**: a vertical spine with phase detail, the active phase's agents
+  and artifact cards.
+- **Prompt footer**: a one-line chain while a run is live, e.g.
+  `WF ✓ Plan ─ ✓ Review ─ ▶ Verify`.
+- **Sidebar**: the newest run and its first four phases; click to open.
+- **Artifacts**: `o` opens a scrollable viewer for the selected or primary
+  artifact (markdown text, table rows, chart points, metrics, board).
+- **Keys** (only while the panel is focused): `j`/`k` move, `o` open artifact,
+  `f` fullscreen, `x` stop (with confirmation).
+
+The graph is computed by `graph.ts` from phases, edges, timings and per-phase
+counts. The same renderer draws the plain-text graph in `workflow_get` results,
+so the transcript and the TUI agree.
 
 ## Script contract
 
@@ -80,8 +102,9 @@ covers topology, phases, verification, artifacts and anti-patterns.
 | `artifacts.ts` | Chart/table/metrics/board store fed by `report()` |
 | `exec.ts` | Bounded `world.run` process execution |
 | `fsx.ts` | Glob, read, grep, git views |
+| `graph.ts` | Framework-free layered layout, edge routing, text rasteriser |
 | `store.ts` | Saved workflows and durable run keys |
-| `tui.tsx` | Session panel (phase graph, agents, artifact cards, log), status dot, palette commands, toasts |
+| `tui.tsx` | Fullscreen canvas, side-panel spine, footer chain, sidebar card, artifact viewer, commands, toasts |
 
 - Runs are journaled in `ctx.storage` under `workflow/run/<id>`; ask results
   under `workflow/cache/<id>`, so `workflow_amend` replays unchanged asks at
@@ -104,11 +127,12 @@ covers topology, phases, verification, artifacts and anti-patterns.
 - Scripts run in-process with the facade injected (`new Function`), not in a
   sandbox. They are model-authored and user-approved; treat them like any other
   code the agent runs.
-- The TUI graph is text (box glyphs); the artifact cards are text renderings.
-  A Desktop GUI part (Solid + SVG) is the next step for richer visuals.
+- The TUI graph is drawn with box glyphs, not a GPU/SVG surface. A Desktop GUI
+  client sharing `graph.ts` geometry is not implemented.
 
 ## Tests
 
 `bun test plugins/workflow` covers compilation, artifact assembly, the run
-engine (phases, concurrency, caching, failures, JSON asks), saved workflows and
-the TUI render helpers.
+engine (phases, concurrency, caching, failures, JSON asks), the graph layout
+(routing, loops, CJK width, fallbacks), saved workflows, the snapshot renderer
+and the TUI helpers.

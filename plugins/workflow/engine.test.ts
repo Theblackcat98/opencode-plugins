@@ -65,6 +65,51 @@ return { plan, a, b }
 		expect(snapshot.agents.length).toBe(3)
 		expect(snapshot.artifacts[0].primary).toBe(true)
 		expect(updates.length).toBeGreaterThan(0)
+
+		// The TUI graph needs timing, counts, edge kinds and phase ownership.
+		expect(snapshot.phases[0].startedAt).toBeNumber()
+		expect(snapshot.phases[0].endedAt).toBeNumber()
+		expect(snapshot.phases[0].agentCount).toBe(1)
+		expect(snapshot.phases[0].askCount).toBe(1)
+		expect(snapshot.phases[1].agentCount).toBe(2)
+		expect(snapshot.phases[1].askCount).toBe(2)
+		expect(snapshot.edges[0]).toMatchObject({ from: 0, to: 1, kind: "forward", traversals: 1 })
+		expect(snapshot.artifacts[0].phase).toBe(1)
+		const planner = snapshot.agents.find((agent) => agent.name === "planner")
+		expect(planner?.phase).toBe(0)
+		const worker = snapshot.agents.find((agent) => agent.name === "worker-a")
+		expect(worker?.phase).toBe(1)
+	})
+
+	test("records a loop edge with its traversals", async () => {
+		const fake = fakeBackend()
+		const engine = new RunEngine(
+			{ id: "wfr-loop", name: "Loop", script: "", args: {} },
+			{
+				directory: process.cwd(),
+				sessionID: "root",
+				subagents: fake.backend,
+				signal: new AbortController().signal,
+				log: () => {},
+				onUpdate: () => {},
+			},
+		)
+		const script = `
+phase("Plan")
+await agent("planner").ask("plan")
+phase("Fix")
+await agent("fixer").ask("fix")
+phase("Plan")
+await agent("planner").ask("plan again")
+return "done"
+`
+		await engine.execute(buildScriptFunction(script))
+		const snapshot = engine.snapshot()
+		const forward = snapshot.edges.find((edge) => edge.from === 0 && edge.to === 1)
+		const loop = snapshot.edges.find((edge) => edge.from === 1 && edge.to === 0)
+		expect(forward).toMatchObject({ kind: "forward", traversals: 1 })
+		expect(loop).toMatchObject({ kind: "loop", traversals: 1 })
+		expect(snapshot.phases[0].visits).toBe(2)
 	})
 
 	test("replays a cached ask without creating a session", async () => {

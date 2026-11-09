@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url"
 import { Plugin, Skill } from "@opencode/plugin"
 import { buildScriptFunction, compileScript } from "./compile.js"
 import { RunEngine, type AskCache, type SubagentBackend } from "./engine.js"
+import { layoutGraph, renderGraph, type GraphPhase } from "./graph.js"
 import { WorkflowRpc } from "./rpc.js"
 import { loadSaved, listSaved, runStorageKey, saveSaved } from "./store.js"
 import type { RunSnapshot, RunSummary } from "./types.js"
@@ -1032,6 +1033,16 @@ export default Plugin.define({
 	},
 })
 
+function phaseDetail(phase: RunSnapshot["phases"][number]): string | undefined {
+	const parts: string[] = []
+	if (phase.agentCount) parts.push(`${phase.agentCount} agent${phase.agentCount === 1 ? "" : "s"}`)
+	if (phase.askCount) parts.push(`${phase.askCount} ask${phase.askCount === 1 ? "" : "s"}`)
+	if (phase.startedAt && phase.endedAt && phase.endedAt > phase.startedAt) {
+		parts.push(`${Math.max(1, Math.round((phase.endedAt - phase.startedAt) / 1000))}s`)
+	}
+	return parts.length ? parts.join(" · ") : undefined
+}
+
 /** Human-readable snapshot for a tool result. */
 export function renderSnapshot(snapshot: RunSnapshot): string {
 	const lines = [
@@ -1040,13 +1051,14 @@ export function renderSnapshot(snapshot: RunSnapshot): string {
 		"",
 	]
 	if (snapshot.phases.length) {
-		lines.push("## Phases")
-		for (const [index, phase] of snapshot.phases.entries()) {
-			const edge = snapshot.edges.find((candidate) => candidate.to === index)
-			const from = edge !== undefined && edge.from !== index ? ` (from ${snapshot.phases[edge.from]?.name ?? `#${edge.from}`})` : ""
-			lines.push(`${index + 1}. [${phase.status}] ${phase.name}${phase.visits > 1 ? ` ×${phase.visits}` : ""}${from}`)
-		}
-		lines.push("")
+		const phases: GraphPhase[] = snapshot.phases.map((phase) => ({
+			name: phase.name,
+			status: phase.status,
+			visits: phase.visits,
+			detail: phaseDetail(phase),
+		}))
+		const graph = layoutGraph(phases, snapshot.edges, { width: 96, mode: "auto", detail: true })
+		lines.push("## Phases", renderGraph(graph), "")
 	}
 	if (snapshot.agents.length) {
 		lines.push("## Subagents")

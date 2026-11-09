@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { artifactLines, entriesOf, isRunSummary, sparkline, unwrap } from "./tui.js"
-import type { ArtifactView, RunSummary } from "./types.js"
+import { artifactLines, artifactText, entriesOf, graphPhases, isRunSummary, sparkline, unwrap } from "./tui.js"
+import type { ArtifactView, RunSnapshot, RunSummary } from "./types.js"
 
 const summary: RunSummary = {
 	id: "wfr-1",
@@ -81,5 +81,49 @@ describe("tui helpers", () => {
 		const lines = artifactLines(board)
 		expect(lines[0]).toBe("todo (1)")
 		expect(lines).toContain("  · one")
+	})
+})
+
+describe("graph view data", () => {
+	const snapshot: RunSnapshot = {
+		...summary,
+		status: "running",
+		phases: [
+			{ name: "Plan", status: "done", visits: 2, startedAt: 1_000, endedAt: 5_000, agentCount: 1, askCount: 2 },
+			{ name: "Work", status: "active", visits: 1, startedAt: 5_000, agentCount: 2, askCount: 3 },
+		],
+		edges: [
+			{ from: 0, to: 1, kind: "forward", traversals: 2 },
+			{ from: 1, to: 0, kind: "loop", traversals: 1 },
+		],
+		agents: [],
+		artifacts: [],
+		items: [],
+		logs: [],
+		args: {},
+		maxConcurrency: 4,
+		script: "",
+	}
+
+	test("graphPhases carries status, visits and a detail line", () => {
+		const phases = graphPhases(snapshot)
+		expect(phases.map((phase) => phase.name)).toEqual(["Plan", "Work"])
+		expect(phases[0].visits).toBe(2)
+		expect(phases[0].detail).toContain("1 agent")
+		expect(phases[0].detail).toContain("2 asks")
+		expect(phases[0].detail).toContain("4s")
+		expect(phases[1].detail).toContain("2 agents")
+	})
+
+	test("artifactText expands a markdown artifact verbatim", () => {
+		const markdown: ArtifactView = {
+			kind: "markdown",
+			id: "report",
+			title: "Report",
+			version: 1,
+			content: "# Findings\n\nAll good.",
+		}
+		expect(artifactText(markdown)).toContain("# Findings")
+		expect(artifactText(markdown)).toContain("All good.")
 	})
 })

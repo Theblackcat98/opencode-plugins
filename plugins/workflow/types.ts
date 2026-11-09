@@ -15,11 +15,19 @@ export interface PhaseInfo {
 	status: PhaseStatus
 	/** How many times the script entered this phase (loops revisit one node). */
 	readonly visits: number
+	readonly startedAt?: number
+	readonly endedAt?: number
+	/** Distinct subagents that asked something while this phase was active. */
+	readonly agentCount?: number
+	readonly askCount?: number
 }
 
 export interface EdgeInfo {
 	readonly from: number
 	readonly to: number
+	/** "loop" when the edge goes back to an earlier phase. */
+	readonly kind: "forward" | "loop"
+	traversals: number
 }
 
 export interface AgentInfo {
@@ -28,6 +36,8 @@ export interface AgentInfo {
 	readonly model?: string
 	readonly asks: number
 	readonly status: "idle" | "running" | "done" | "error"
+	/** Index of the phase this agent last worked in. */
+	readonly phase?: number
 }
 
 export interface FieldRef {
@@ -42,6 +52,8 @@ interface ArtifactBase {
 	readonly description?: string
 	readonly primary?: boolean
 	readonly version: number
+	/** Index of the phase that published it, when one was active. */
+	readonly phase?: number
 }
 
 export interface MarkdownArtifact extends ArtifactBase {

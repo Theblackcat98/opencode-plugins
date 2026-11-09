@@ -159,8 +159,10 @@ artifacts the user keeps. Modelled on ZCode's dynamic workflows.
   `files`, `git`, `report`, `artifact.*`, `channel`, `future`.
 - Every run journals its asks; `workflow_amend` replays unchanged asks from
   cache, so a revision pays only for what changed.
-- The TUI half shows a session panel with the phase graph, live agents, artifact
-  cards and the log, plus a prompt status dot, palette commands and toasts.
+- The TUI half draws the run as a layered character-cell canvas (fullscreen),
+  a phase spine (side panel), a one-line chain in the prompt footer and a
+  sidebar card, with a phase inspector, artifact viewer, click-to-select nodes,
+  palette commands and toasts.
 - Full reference and design guide: [`docs/workflow-plugin.md`](docs/workflow-plugin.md).
 - Short usage summary and limits: `plugins/workflow/README.md`.
 

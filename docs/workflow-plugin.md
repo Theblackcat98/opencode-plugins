@@ -739,35 +739,102 @@ kinds differ; clients narrow by `kind`.
 
 ## 11. TUI
 
-`tui.tsx` is the `./tui` part of the package.
+`tui.tsx` is the `./tui` part of the package; `graph.ts` is the framework-free
+layout and rasteriser both halves share.
 
-### Session panel
+### The graph
 
-Opened with the palette command **Open workflow run** (`workflow.panel`). The
-panel shows the newest run for the session (or the one chosen with **Switch
-workflow run**):
+A run has four visual surfaces:
 
-- header: status glyph, name, id, phase progress, agent count;
-- phase graph: `✓` done, `▶` active, `·` pending, `✗` error, `×n` visits,
-  `↺` loop target;
-- subagents with ask counts and status;
-- artifact cards:
-  - markdown: first 14 lines;
+| Surface | Slot | Shape |
+| --- | --- | --- |
+| Fullscreen canvas | `session.panel` with `presentation: "fullscreen"` | Layered left-to-right graph of node boxes and routed edges |
+| Side panel | `session.panel` | Vertical spine with the selected phase's agents and artifacts |
+| Prompt footer | `prompt.footer.status` | One-line chain: `WF ✓ Plan ─ ✓ Review ─ ▶ Verify` |
+| Sidebar | `sidebar.content` | Status, progress and the first four phases |
+
+The canvas is computed, not hand-drawn:
+
+1. **Layering.** Forward edges (`to > from`) get longest-path layers, so a node
+   sits after everything that must finish before it. Back edges (`to <= from`)
+   are loop edges and are routed below the graph.
+2. **Ordering.** A barycentre pass reorders each layer to reduce crossings;
+   ties keep phase order, so the picture is stable between snapshots.
+3. **Sizing.** A node is a rounded box, 12–30 cells wide, 3 rows high, or 4
+   with a detail line (`2 agents · 41s`). Nodes are centred in their layer.
+4. **Routing.** Edges leave the right border, turn at a lane in the column gap,
+   and enter the target's left border with `▶`. A loop leaves the bottom, runs
+   along a bus below the graph, and enters the target from below with `▲`.
+5. **Rasterising.** The layout is written into a character grid with semantic
+   roles (`done`, `active`, `pending`, `error`, `line`, `loop`). The TUI maps
+   roles to theme colours; tool output maps them to plain text.
+
+The TUI draws the edge grid as absolutely positioned text rows under absolutely
+positioned node boxes. Node boxes carry their own border, background and
+`onMouseDown`, so clicking a node selects it while edges stay non-interactive.
+Plain output (`workflow_get`, `workflow_create`) uses the same `graph.ts`
+renderer at 96 cells, so the transcript and the TUI show the same shape.
+
+Narrow or crowded graphs fall back in this order: compact canvas, vertical
+spine, single-line chain. Wide CJK names are counted as two cells and truncated
+at cell boundaries. A node revisited by a loop keeps one box, gains `↺`, and
+shows `×n` visits.
+
+The active node's border pulses between two theme tones every 700 ms while the
+run is live and the panel is focused. Loops and the active edge use distinct
+theme colours; status is always encoded by both a glyph and a colour.
+
+### Side panel
+
+Opened with **Open workflow run** (`workflow.panel`). It shows the newest run
+for the session, or the one chosen with **Switch workflow run**:
+
+- header: status glyph, name, id, phase progress, agent count, elapsed time;
+- a spine of phases: `✓` done, `▶` active, `·` pending, `✗` error, `×n` visits,
+  `↺` loop target, with the phase detail right-aligned;
+- the selected phase's agents (name, ask count, status);
+- the selected phase's artifact cards:
+  - markdown: first lines of the text;
   - file: path and size;
   - chart: a sparkline plus the latest value;
   - table: header plus the last eight rows;
   - metrics: field/value pairs;
   - board: columns with up to three cards each;
-- the last ten log lines;
-- the error message, when there is one.
+- the last log lines and the error, when there is one;
+- `o` opens the selected or primary artifact in a scrollable dialog.
+
+### Fullscreen
+
+`f` (or the host's fullscreen control) switches the panel to `fullscreen`: the
+canvas across the top, then a bordered inspector (phase, agents, artifacts,
+log) and an artifact column below. The canvas gets the full pane width and
+falls back to the spine when the picture cannot fit, so the panel never
+overflows. The host forces fullscreen when the pane is narrower than 108
+cells, so `f` is a no-op there.
 
 ### Status and notifications
 
-- A prompt-footer dot shows `WF done/total` while a run is running or queued.
-- A sidebar card shows the newest run's status.
+- The footer chain replaces the old `WF done/total` text while a run is live;
+  it needs a snapshot, so the TUI lazily fetches one for the newest live run.
+- The sidebar card shows the newest run and its first four phases. Clicking it
+  opens the panel.
 - On `finished`, a toast reports completion, stop or failure, and failures also
   raise an attention notification.
 - Repeats of the same terminal event are de-duplicated in TUI storage.
+
+### Keys
+
+| Key | Command | Action |
+| --- | --- | --- |
+| `j` / `k` | `workflow.next` / `workflow.previous` | Move the phase selection |
+| `o` | `workflow.artifact` | Open the selected/primary artifact |
+| `f` | `workflow.fullscreen` | Toggle fullscreen |
+| `x` | `workflow.stop.key` | Confirm and stop the run |
+
+The layer is enabled only when the workflow panel is open and focused, so it
+does not steal `j`/`k`/`o`/`f`/`x` from the prompt. `keymap.layer()` is registered
+inside the mounted `app` slot, never in `setup()`, because it needs a Solid
+owner.
 
 ### Commands
 
@@ -777,14 +844,11 @@ workflow run**):
 | `workflow.list` | Switch workflow run | Picks a run from a select dialog |
 | `workflow.stop` | Stop workflow run | Confirms, then calls `stopRun` |
 
-`keymap.layer()` is registered inside the mounted `app` slot, never in
-`setup()`, because it needs a Solid owner.
-
 ### Recovery
 
-RPC subscriptions are live-only. `setup` calls `listRuns` once, and the panel
-refreshes `getRun` when the selection changes or an `updated` event arrives for
-the selected run.
+RPC subscriptions are live-only. `setup` calls `listRuns` once; the TUI keeps
+the last eight snapshots in memory, fetches one on demand for the newest live
+run, and refreshes it when an `updated` event arrives for the selected run.
 
 ## 12. Caps and constants
 
@@ -807,6 +871,9 @@ the selected run.
 | Event throttle | 250 ms | `index.ts` |
 | Persist throttle | 1.5 s | `index.ts` |
 | `workflow_wait` default / max | 30 min / 2 h | `index.ts` |
+| TUI snapshot cache | 8 runs | `tui.tsx` |
+| Canvas node width | 12–30 cells | `graph.ts` |
+| Footer chain width | 64 cells | `tui.tsx` |
 
 ## 13. Permissions and security
 
@@ -858,8 +925,10 @@ Known gaps against the ZCode feature:
    `parentID` in the pinned SDK.
 6. **No TUI interleaving into the timeline.** Runs appear in a panel and as
    synthetic messages, not as first-class timeline cards.
-7. **TUI visuals are text.** A Desktop GUI part (`./gui-experimental`) with a
-   Solid panel, an SVG graph and real charts is the natural next step.
+7. **TUI visuals are character cells.** The canvas is a real layered graph, but
+   it is drawn with box glyphs; there is no GPU or SVG surface. The GUI client
+   (Solid + SVG, sharing `graph.ts` geometry) is not implemented — this plugin
+   version exposes no GUI host API.
 8. **Saved workflow args do not merge defaults.**
 
 ## 16. Development
@@ -867,7 +936,7 @@ Known gaps against the ZCode feature:
 ```sh
 cd ~/Documents/Projects/opencode-plugins
 bun install
-bun test plugins/workflow      # 30 tests
+bun test plugins/workflow      # 51 tests
 bun run typecheck              # tsc --noEmit, whole repo
 ```
 
@@ -883,7 +952,8 @@ Layout:
 | `exec.ts` | Bounded process execution |
 | `fsx.ts` | Glob/read/grep/git |
 | `store.ts` | Saved workflows, storage keys |
-| `tui.tsx` | Panel, status dot, commands, toasts |
+| `graph.ts` | Framework-free layered layout, edge routing and text rasteriser |
+| `tui.tsx` | Canvas, spine, footer chain, sidebar card, commands, toasts |
 | `types.ts` | Shared types |
 | `SKILL.md` | Authoring contract the model loads |
 

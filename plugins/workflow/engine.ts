@@ -200,6 +200,8 @@ export class RunEngine {
 	private readonly anonymous: AgentSlot[] = []
 	private readonly phaseList: PhaseInfo[] = []
 	private readonly edgeList: EdgeInfo[] = []
+	private readonly phaseAgents = new Map<number, Set<string>>()
+	private readonly artifactPhase = new Map<string, number>()
 	private readonly items: unknown[] = []
 	private readonly logs: string[] = []
 	private readonly cache?: AskCache
@@ -254,7 +256,10 @@ export class RunEngine {
 			edges: this.edgeList.map((edge) => ({ ...edge })),
 			...(this.currentPhase >= 0 ? { currentPhase: this.currentPhase } : {}),
 			agents: [...this.agents.values()].map((slot) => ({ ...slot.info })).concat(this.anonymous.map((slot) => ({ ...slot.info }))),
-			artifacts: this.artifacts.views(),
+			artifacts: this.artifacts.views().map((artifact) => {
+				const phase = this.artifactPhase.get(artifact.id)
+				return phase === undefined ? artifact : { ...artifact, phase }
+			}),
 			items: this.items.slice(-200),
 			logs: [...this.logs],
 			args: { ...this.args },
@@ -290,7 +295,10 @@ export class RunEngine {
 		if (this.status !== "running") return
 		this.status = "completed"
 		this.endedAt = Date.now()
-		for (const phase of this.phaseList) if (phase.status === "active") phase.status = "done"
+		for (const [index, phase] of this.phaseList.entries()) {
+			if (phase.status !== "active") continue
+			this.phaseList[index] = { ...phase, status: "done", endedAt: this.endedAt }
+		}
 		this.currentPhase = -1
 		this.logLine("Completed.")
 		this.deps.onUpdate()
@@ -306,7 +314,10 @@ export class RunEngine {
 			...(error instanceof Error && error.stack ? { stack: error.stack.split("\n").slice(0, 8).join("\n") } : {}),
 			kind: error instanceof ProcessError ? "script" : "script",
 		}
-		for (const phase of this.phaseList) if (phase.status === "active") phase.status = "error"
+		for (const [index, phase] of this.phaseList.entries()) {
+			if (phase.status !== "active") continue
+			this.phaseList[index] = { ...phase, status: "error", endedAt: this.endedAt }
+		}
 		this.currentPhase = -1
 		this.logLine(`Errored: ${message}`)
 		this.deps.onUpdate()
@@ -317,7 +328,10 @@ export class RunEngine {
 		this.status = "stopped"
 		this.endedAt = Date.now()
 		this.error = undefined
-		for (const phase of this.phaseList) if (phase.status === "active") phase.status = "pending"
+		for (const [index, phase] of this.phaseList.entries()) {
+			if (phase.status !== "active") continue
+			this.phaseList[index] = { ...phase, status: "pending", endedAt: this.endedAt }
+		}
 		this.currentPhase = -1
 		this.logLine(reason)
 		this.deps.onUpdate()
@@ -341,24 +355,55 @@ export class RunEngine {
 
 	private advancePhase(name: string): void {
 		if (!name.trim()) throw new Error("phase() needs a non-empty name.")
+		const now = Date.now()
 		let index = this.phaseList.findIndex((phase) => phase.name === name)
 		if (index === -1) {
-			this.phaseList.push({ name, status: "active", visits: 1 })
+			this.phaseList.push({ name, status: "active", visits: 1, startedAt: now })
 			index = this.phaseList.length - 1
 		} else {
 			const existing = this.phaseList[index]
-			this.phaseList[index] = { ...existing, status: "active", visits: existing.visits + 1 }
+			this.phaseList[index] = {
+				...existing,
+				status: "active",
+				visits: existing.visits + 1,
+				startedAt: existing.startedAt ?? now,
+				endedAt: undefined,
+			}
 		}
 		if (this.currentPhase !== -1 && this.currentPhase !== index) {
-			if (this.phaseList[this.currentPhase]?.status === "active") {
-				this.phaseList[this.currentPhase] = { ...this.phaseList[this.currentPhase], status: "done" }
+			const previous = this.phaseList[this.currentPhase]
+			if (previous?.status === "active") {
+				this.phaseList[this.currentPhase] = { ...previous, status: "done", endedAt: now }
 			}
-			if (!this.edgeList.some((edge) => edge.from === this.currentPhase && edge.to === index)) {
-				this.edgeList.push({ from: this.currentPhase, to: index })
+			const existing = this.edgeList.find((edge) => edge.from === this.currentPhase && edge.to === index)
+			if (existing) {
+				existing.traversals += 1
+			} else {
+				this.edgeList.push({
+					from: this.currentPhase,
+					to: index,
+					kind: index < this.currentPhase ? "loop" : "forward",
+					traversals: 1,
+				})
 			}
 		}
 		this.currentPhase = index
 		this.deps.onUpdate()
+	}
+
+	private touchAsk(slot: AgentSlot): void {
+		if (this.currentPhase < 0) return
+		const phase = this.phaseList[this.currentPhase]
+		if (!phase) return
+		const agents = this.phaseAgents.get(this.currentPhase) ?? new Set<string>()
+		agents.add(slot.info.name)
+		this.phaseAgents.set(this.currentPhase, agents)
+		this.phaseList[this.currentPhase] = {
+			...phase,
+			agentCount: agents.size,
+			askCount: (phase.askCount ?? 0) + 1,
+		}
+		slot.info = { ...slot.info, phase: this.currentPhase }
 	}
 
 	private slot(name?: string, persona?: string): AgentSlot {
@@ -390,6 +435,7 @@ export class RunEngine {
 
 		const askAgent = async (slot: AgentSlot, text: string, jsonHint?: string): Promise<string> => {
 			ensureAbort()
+			this.touchAsk(slot)
 			const rolePrefix = slot.info.asks === 0 && slot.persona ? `Role for this conversation: ${slot.persona}\n\n` : ""
 			const body = `${rolePrefix}${text}`
 			const prompt = jsonHint ? `${body}\n\nReply with only a JSON object, no prose, no markdown fences.` : body
@@ -440,6 +486,10 @@ export class RunEngine {
 				throw new Error(`Path "${path}" is outside the workspace.`)
 			}
 			return absolute
+		}
+
+		const tagArtifact = (id: unknown): void => {
+			if (this.currentPhase >= 0) this.artifactPhase.set(String(id ?? ""), this.currentPhase)
 		}
 
 		const facade: Record<string, unknown> = {
@@ -514,21 +564,43 @@ export class RunEngine {
 				update()
 			},
 			artifact: Object.freeze({
-				markdown: (id: unknown, content: unknown, opts?: unknown) => this.artifacts.markdown(String(id ?? ""), String(content ?? ""), (opts ?? {}) as never),
+				markdown: (id: unknown, content: unknown, opts?: unknown) => {
+					const value = this.artifacts.markdown(String(id ?? ""), String(content ?? ""), (opts ?? {}) as never)
+					tagArtifact(id)
+					return value
+				},
 				file: async (id: unknown, path: unknown, opts?: unknown) => {
 					const absolute = workspacePath(String(path ?? ""))
 					const info = await stat(absolute)
 					if (!info.isFile()) throw new Error(`artifact.file: ${path} is not a file.`)
 					const contentType = CONTENT_TYPES[extname(absolute).toLowerCase()]
-					return this.artifacts.file(String(id ?? ""), String(path ?? ""), info.size, {
+					const value = this.artifacts.file(String(id ?? ""), String(path ?? ""), info.size, {
 						...((opts ?? {}) as object),
 						...(contentType ? { contentType } : {}),
 					} as never)
+					tagArtifact(id)
+					return value
 				},
-				chart: (id: unknown, spec: unknown) => this.artifacts.chart(String(id ?? ""), spec as ChartSpec),
-				table: (id: unknown, spec: unknown) => this.artifacts.table(String(id ?? ""), spec as TableSpec),
-				metrics: (id: unknown, spec: unknown) => this.artifacts.metrics(String(id ?? ""), spec as MetricsSpec),
-				board: (id: unknown, spec: unknown) => this.artifacts.board(String(id ?? ""), spec as BoardSpec),
+				chart: (id: unknown, spec: unknown) => {
+					const value = this.artifacts.chart(String(id ?? ""), spec as ChartSpec)
+					tagArtifact(id)
+					return value
+				},
+				table: (id: unknown, spec: unknown) => {
+					const value = this.artifacts.table(String(id ?? ""), spec as TableSpec)
+					tagArtifact(id)
+					return value
+				},
+				metrics: (id: unknown, spec: unknown) => {
+					const value = this.artifacts.metrics(String(id ?? ""), spec as MetricsSpec)
+					tagArtifact(id)
+					return value
+				},
+				board: (id: unknown, spec: unknown) => {
+					const value = this.artifacts.board(String(id ?? ""), spec as BoardSpec)
+					tagArtifact(id)
+					return value
+				},
 			}),
 			channel: (name?: unknown) => new AsyncQueue(String(name ?? "channel")),
 			future: (body: unknown) => {
