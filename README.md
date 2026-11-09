@@ -161,7 +161,8 @@ artifacts the user keeps. Modelled on ZCode's dynamic workflows.
   cache, so a revision pays only for what changed.
 - The TUI half shows a session panel with the phase graph, live agents, artifact
   cards and the log, plus a prompt status dot, palette commands and toasts.
-- Full details and limits: `plugins/workflow/README.md`.
+- Full reference and design guide: [`docs/workflow-plugin.md`](docs/workflow-plugin.md).
+- Short usage summary and limits: `plugins/workflow/README.md`.
 
 ## Install a plugin for local use
 

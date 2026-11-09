@@ -6,6 +6,9 @@ graph, reports as it goes, and publishes artifact cards the user keeps.
 Modelled on ZCode's `dynamic-workflows` skill, rebuilt against OpenCode V2's
 plugin API (server + TUI + RPC).
 
+Full reference — concepts, facade, tools, RPC, TUI, caps, security, recovery:
+[`docs/workflow-plugin.md`](../../docs/workflow-plugin.md).
+
 ## Usage
 
 ```

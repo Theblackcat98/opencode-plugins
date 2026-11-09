@@ -138,7 +138,11 @@ export async function globFiles(root: string, patterns: readonly string[], limit
 }
 
 export async function readText(root: string, path: string): Promise<string> {
-	const absolute = resolve(root, path)
+	const base = resolve(root)
+	const absolute = resolve(base, path)
+	if (absolute !== base && !absolute.startsWith(base + sep)) {
+		throw new Error(`files.read: ${path} is outside the workspace.`)
+	}
 	const info = await stat(absolute)
 	if (!info.isFile()) throw new Error(`files.read: ${path} is not a file.`)
 	if (info.size > READ_LIMIT) throw new Error(`files.read: ${path} is larger than ${READ_LIMIT} bytes.`)
