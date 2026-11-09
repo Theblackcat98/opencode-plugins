@@ -84,6 +84,9 @@ The user experiences the run through its phase graph. Every stage opens with
 - Two markers with the same name are one node, so a loop body stays one box.
 - No `phase()` inside a per-item fan-out callback. Put the marker at the top of
   the stage that contains the fan-out.
+- The TUI draws each name as a node and records the agents, asks and time spent
+  under it automatically. Keep names short enough to read as labels; a loop
+  already shows `↺` and a visit count, so do not encode rounds in the name.
 
 ## Topology
 

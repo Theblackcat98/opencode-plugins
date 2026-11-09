@@ -695,14 +695,16 @@ On restart, any snapshot still marked `running` or `queued` is rehydrated as
 
 ### Graph semantics
 
-- Nodes are created by name on first `phase()`.
-- An edge is added from the previously active node to the new one, once.
+- Nodes are created by name on first `phase()`; a revisit keeps one node and
+  increments `visits`.
+- An edge records its kind (`forward` or `loop`) and how many times it was
+  traversed.
 - Moving on marks the previous node `done`; the run's completion marks the last
   active node `done`; a failure marks it `error`.
-- A node revisited by a loop keeps one entry and increments `visits`.
-- The panel marks back-edges with `↺`.
-- Edges are not rendered as text in tool results beyond "(from X)"; the panel
-  and the snapshot carry the full edge list.
+- Each node records `startedAt`, `endedAt`, `agentCount` and `askCount`.
+- Tool results draw the graph with `graph.ts`. The snapshot carries the phase
+  and edge arrays; the TUI draws loop back-edges as a bus below the nodes and
+  marks the target with `↺`.
 
 ## 10. RPC API
 
